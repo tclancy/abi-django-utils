@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "abi-django-utils"
+version = "0.1.0"
+description = "Shared Django utilities for Tom Clancy's projects (A Better Internet pattern library)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "django>=4.2",
+]
+
+[project.optional-dependencies]
+dev-tools = [
+    "django-debug-toolbar>=4.0",
+    "nplusone>=1.0",
+]
+
+[project.urls]
+Repository = "https://github.com/tclancy/abi-django-utils"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/abi_django_utils"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
