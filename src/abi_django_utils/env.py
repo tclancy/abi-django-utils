@@ -24,7 +24,10 @@ def int(name: builtins.str, default: builtins.int = 0) -> builtins.int:
     raw = os.environ.get(name)
     if raw is None:
         return default
-    return builtins.int(raw.strip())
+    try:
+        return builtins.int(raw.strip())
+    except ValueError:
+        raise ValueError(f"Environment variable {name!r} is not a valid integer: {raw!r}") from None
 
 
 def list(name: builtins.str, default: builtins.list[builtins.str] | None = None) -> builtins.list[builtins.str]:

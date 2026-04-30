@@ -76,11 +76,11 @@ class TestInt:
         monkeypatch.setenv("TEST_VAR", "-5")
         assert env.int("TEST_VAR") == -5
 
-    def test_invalid_raises(self, monkeypatch):
+    def test_invalid_raises_with_var_name(self, monkeypatch):
         monkeypatch.setenv("TEST_VAR", "not_a_number")
         import pytest
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="TEST_VAR"):
             env.int("TEST_VAR")
 
 

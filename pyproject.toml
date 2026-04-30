@@ -18,10 +18,6 @@ dependencies = [
 sentry = [
     "sentry-sdk>=2.0",
 ]
-dev-tools = [
-    "django-debug-toolbar>=4.0",
-    "nplusone>=1.0",
-]
 
 [project.urls]
 Repository = "https://github.com/tclancy/abi-django-utils"

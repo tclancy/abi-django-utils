@@ -1,11 +1,11 @@
 """TLS proxy (Cloudflare Tunnel) settings helpers."""
 
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]"})
+_SKIP_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "*"})
 
 
 def csrf_trusted_origins(hosts: list[str]) -> list[str]:
     """Promote public ALLOWED_HOSTS to https:// origins for CSRF."""
-    return [f"https://{h}" for h in hosts if h not in _LOOPBACK_HOSTS]
+    return [f"https://{h}" for h in hosts if h not in _SKIP_HOSTS]
 
 
 def cloudflare_tunnel_defaults(*, allowed_hosts: list[str], debug: bool = True) -> dict:

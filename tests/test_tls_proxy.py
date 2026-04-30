@@ -64,6 +64,17 @@ class TestCsrfTrustedOrigins:
             "https://api.example.com",
         ]
 
+    def test_wildcard_filtered(self):
+        """Test that wildcard * is filtered out (would produce invalid https://* origin)."""
+        result = tls_proxy.csrf_trusted_origins(["*", "example.com"])
+        assert result == ["https://example.com"]
+        assert "https://*" not in result
+
+    def test_subdomain_pattern_preserved(self):
+        """Test that Django's .example.com subdomain syntax is preserved."""
+        result = tls_proxy.csrf_trusted_origins([".example.com", "api.example.com"])
+        assert result == ["https://.example.com", "https://api.example.com"]
+
     def test_public_hosts_with_ports(self):
         """Test that hosts with port numbers are preserved."""
         result = tls_proxy.csrf_trusted_origins(["example.com:8000", "api.example.com:3000"])
