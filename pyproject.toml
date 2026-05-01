@@ -11,12 +11,12 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
     "django>=4.2",
+    "whitenoise>=6.0",
 ]
 
 [project.optional-dependencies]
-dev-tools = [
-    "django-debug-toolbar>=4.0",
-    "nplusone>=1.0",
+sentry = [
+    "sentry-sdk>=2.0",
 ]
 
 [project.urls]
@@ -31,3 +31,19 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=abi_django_utils --cov-report=term-missing"
+
+[tool.coverage.run]
+source = ["src/abi_django_utils"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.2.0",
+    "pytest>=9.0.3",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.15.12",
+    "sentry-sdk>=2.0",
+]
