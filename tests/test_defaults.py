@@ -78,6 +78,12 @@ class TestDjangoDefaults:
         assert result["LOGGING"]["root"]["level"] == "ERROR"
         assert result["LOGGING"]["loggers"]["django"]["level"] == "ERROR"
 
+    def test_default_is_production_safe(self, monkeypatch):
+        monkeypatch.delenv("DJANGO_LOG_LEVEL", raising=False)
+        result = defaults.django_defaults()
+        assert result["STORAGES"]["staticfiles"]["BACKEND"] == "whitenoise.storage.CompressedManifestStaticFilesStorage"
+        assert result["LOGGING"]["root"]["level"] == "WARNING"
+
     def test_does_not_include_deprecated_staticfiles_storage(self):
         result = defaults.django_defaults()
         assert "STATICFILES_STORAGE" not in result
