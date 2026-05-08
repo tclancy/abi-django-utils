@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 
-def django_defaults(*, debug: bool = True) -> dict:
+def django_defaults(*, debug: bool = False) -> dict:
     """Return a dict of opinionated Django settings defaults.
 
     Log level respects ``DJANGO_LOG_LEVEL`` env var; falls back to WARNING
