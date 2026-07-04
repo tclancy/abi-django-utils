@@ -60,8 +60,8 @@ class TestDjangoDefaults:
         logging_config = result["LOGGING"]
         assert logging_config["version"] == 1
         assert logging_config["disable_existing_loggers"] is False
-        assert logging_config["root"]["level"] == "DEBUG"
-        assert logging_config["loggers"]["django"]["level"] == "DEBUG"
+        assert logging_config["root"]["level"] == "INFO"
+        assert logging_config["loggers"]["django"]["level"] == "INFO"
         assert logging_config["loggers"]["django.request"]["level"] == "ERROR"
         assert logging_config["loggers"]["django.request"]["propagate"] is False
 
