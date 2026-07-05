@@ -9,9 +9,13 @@ def django_defaults(*, debug: bool = False) -> dict:
     """Return a dict of opinionated Django settings defaults.
 
     Log level respects ``DJANGO_LOG_LEVEL`` env var; falls back to WARNING
-    in production and DEBUG in development.
+    in production and INFO in development. Framework ``DEBUG`` is opt-in
+    via ``DJANGO_LOG_LEVEL=DEBUG`` — the default avoids
+    ``django.utils.autoreload`` emitting one mtime line per watched file on
+    every ``runserver`` reload snapshot (unusable noise once a project pulls
+    in debug_toolbar, nplusone, or large vendor SDKs).
     """
-    log_level = os.environ.get("DJANGO_LOG_LEVEL", "DEBUG" if debug else "WARNING")
+    log_level = os.environ.get("DJANGO_LOG_LEVEL", "INFO" if debug else "WARNING")
 
     settings: dict = {
         "LANGUAGE_CODE": "en-us",
