@@ -12,6 +12,9 @@ uv add git+https://github.com/tclancy/abi-django-utils
 
 # With Sentry support
 uv add "abi-django-utils[sentry] @ git+https://github.com/tclancy/abi-django-utils"
+
+# With Authelia OIDC support
+uv add "abi-django-utils[oidc] @ git+https://github.com/tclancy/abi-django-utils"
 ```
 
 ## Usage
@@ -61,6 +64,90 @@ sentry.init(debug=DEBUG)
 ### `sentry` — Sentry error monitoring
 
 `sentry.init(debug=True, traces_sample_rate=0.1)` — initializes Sentry from `SENTRY_DSN` env var. No-op when `debug=True` or DSN is empty.
+
+### `oidc` — Authelia OIDC via `mozilla-django-oidc`
+
+Requires the `[oidc]` extra. Adds Authelia single sign-on to a Django app as an **additional** login option — the password form at `/accounts/login/` stays the default; `oidc.configure()` deliberately does not set `LOGIN_URL`.
+
+```python
+# settings.py
+from abi_django_utils import env, defaults, tls_proxy, oidc, sentry
+
+DEBUG = env.bool("DJANGO_DEBUG", default=True)
+ALLOWED_HOSTS = env.list("DJANGO_ALLOWED_HOSTS", default=["localhost", "127.0.0.1"])
+SECRET_KEY = env.str("DJANGO_SECRET_KEY", default="dev-insecure-key")
+
+INSTALLED_APPS = [
+    # ...
+    "mozilla_django_oidc",
+]
+
+AUTHENTICATION_BACKENDS = (
+    "django.contrib.auth.backends.ModelBackend",              # primary — password login still works
+    "abi_django_utils.oidc.AutheliaOIDCBackend",              # appended — OIDC as additional option
+)
+
+locals().update(defaults.django_defaults(debug=DEBUG))
+locals().update(tls_proxy.cloudflare_tunnel_defaults(allowed_hosts=ALLOWED_HOSTS, debug=DEBUG))
+locals().update(oidc.configure(
+    issuer_url=env.str("OIDC_ISSUER_URL", default="https://auth.tomclancy.info"),
+    client_id=env.str("OIDC_CLIENT_ID"),
+    client_secret=env.str("OIDC_CLIENT_SECRET"),
+))
+sentry.init(debug=DEBUG)
+```
+
+```python
+# urls.py
+urlpatterns = [
+    path("oidc/", include("mozilla_django_oidc.urls")),
+    # ... app urls
+]
+```
+
+**Additive login template snippet** — put on your login page so users can choose:
+
+```django
+{# templates/registration/login.html — password form goes above #}
+<form method="post">{% csrf_token %}{{ form.as_p }}<button type="submit">Sign in</button></form>
+
+<p>Or <a href="{% url 'oidc_authentication_init' %}">sign in with Authelia</a></p>
+```
+
+Retire password login on a given app later (if you want) with one line: `LOGIN_URL = "/oidc/authenticate/"` in that app's `settings.py`. The library never makes that decision for you.
+
+#### Behavior
+
+- **Case-insensitive email link.** OIDC user → Django user matches by `email__iexact`. `Tom@Example.com` at Authelia and `tom@example.com` in Django link to the same user, no duplicate.
+- **First-login provisioning.** Unknown email → `create_user()` with the lowercased email and `preferred_username` (or the local-part of the email) as the username.
+- **`oidc:`-namespaced group sync.** Authelia `groups` claim `["admins"]` → Django group `oidc:admins`. Groups without the `oidc:` prefix (e.g. `staff`, per-app permission groups) are never touched — safe to mix local-only groups with IdP-managed groups.
+- **RP-initiated logout.** Django `logout()` calls Authelia's `/api/oidc/logout` with the stored `id_token_hint` so the SSO session ends too. Otherwise a "logged-out" user hits any protected view and is silently re-authenticated.
+- **`RS256` signing algo.** `mozilla-django-oidc` defaults to `HS256`; Authelia signs with RSA. `configure()` sets `RS256` explicitly.
+
+#### Homelab-side (Authelia)
+
+Add a client block to `authelia-configuration.yml.j2` for each Django app:
+
+```yaml
+- client_id: 'heydover'
+  client_name: 'Hey Dover'
+  client_secret: '{{ authelia_heydover_client_secret_hash }}'
+  public: false
+  authorization_policy: 'two_factor'
+  redirect_uris:
+    - 'https://heydover.tomclancy.info/oidc/callback/'
+  scopes: ['openid', 'profile', 'email', 'groups']
+  response_types: ['code']
+  grant_types: ['authorization_code']
+  token_endpoint_auth_method: 'client_secret_post'
+  userinfo_signed_response_alg: 'none'
+```
+
+Two vault entries per app: `vault_<app>_oidc_client_secret` (plaintext, mapped into the app's env) and `vault_authelia_<app>_client_secret_hash` (PBKDF2 hash, into Authelia config). Seed both with `openssl rand -hex 32` + `docker run --rm authelia/authelia:latest authelia crypto hash generate pbkdf2 --password <plaintext>`.
+
+#### Swapping to `django-allauth` later
+
+If a specific project needs `django-allauth` (e.g. adding more social providers), the swap is ~10 minutes and reuses the same `User` rows — both libraries link the local user by email. Replace the 3 `abi_django_utils.oidc` settings lines with `django-allauth`'s `SOCIALACCOUNT_PROVIDERS` block, swap `urls.py` `/oidc/` include for `/accounts/`, and update the Authelia `redirect_uris` to `/accounts/oidc/authelia/login/callback/`. See [issue #8](https://github.com/tclancy/abi-django-utils/issues/8) discussion for the full recipe.
 
 ## Env Var Conventions
 

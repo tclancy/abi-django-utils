@@ -18,6 +18,9 @@ dependencies = [
 sentry = [
     "sentry-sdk>=2.0",
 ]
+oidc = [
+    "mozilla-django-oidc>=5.0",
+]
 
 [project.urls]
 Repository = "https://github.com/tclancy/abi-django-utils"
@@ -41,9 +44,11 @@ source = ["src/abi_django_utils"]
 
 [dependency-groups]
 dev = [
+    "mozilla-django-oidc>=5.0",
     "pre-commit>=4.2.0",
     "pytest>=9.0.3",
     "pytest-cov>=7.1.0",
+    "pytest-django>=4.9.0",
     "ruff>=0.15.12",
     "sentry-sdk>=2.0",
 ]
