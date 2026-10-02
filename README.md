@@ -216,25 +216,71 @@ for tenant in tenants:
         call_command("rebuild_index", tenant=tenant.id)
 ```
 
-`new_window()` is a no-op when no guard is active, so production code can call
-it unconditionally.
+`new_window()` is a no-op when no guard is active, so a helper shared between a
+test and a management command can call it unconditionally. Don't import this
+module *from* production code, though — it pulls `django.test.runner` and
+registers an `atexit` hook at import.
 
 #### What is and is not covered
 
 `execute_wrapper` is registered on the connections *this process* holds, and
-Django's `connections` is thread-local. So:
+Django's `connections` is thread-local. ORM work on another thread therefore uses
+a connection the guard never wrapped.
 
-- **Covered:** sync views, `async` views, `AsyncClient`, and Django's own async
-  ORM (`async for`, `acreate`). asgiref's default thread-sensitive executor runs
-  that work on the main thread, which is where the wrapper is.
-- **Covered:** every database alias, and `--parallel` workers. A `spawn`-started
-  worker inherits no monkeypatch, so the runner installs the guard inside each
-  one; if Django's private worker hook ever moves, `--parallel` is **refused**
-  rather than silently running unguarded.
-- **Not covered:** `sync_to_async(..., thread_sensitive=False)` and a bare
-  `threading.Thread`. Those use a connection the guard never wrapped. On SQLite
-  that usually announces itself; on PostgreSQL it is silent. There is no fix
-  available from inside a wrapper, so it is documented rather than worked around.
+**The dividing line is how the event loop is entered, not sync versus async.**
+`sync_to_async`'s default `thread_sensitive=True` means "run on the thread the
+outer *synchronous* caller is on" — and with no outer synchronous caller it falls
+through to a shared single-worker thread pool instead. Measured on
+asgiref 3.11 / Django 6.0:
+
+| entry point | thread-sensitive work runs on | covered |
+|---|---|---|
+| `async_to_sync(coro)()` | `MainThread` | yes |
+| Django `async def test_*` | `MainThread` | yes |
+| `asyncio.run(coro)` | pool worker | **no** |
+| `asyncio.run` + `ThreadSensitiveContext` | pool worker | **no** |
+
+**Covered:**
+
+- Sync tests and sync views.
+- `async` views through `AsyncClient`, and Django's async ORM (`async for`,
+  `aget`) inside them.
+- Django's own `async def test_*` methods — `SimpleTestCase` wraps them in
+  `async_to_sync` before calling them, which is what keeps them on the main thread.
+- Every configured database alias.
+- `--parallel` workers. A `spawn`-started worker inherits no monkeypatch, so the
+  runner installs the guard inside each one; if Django's private worker hook ever
+  moves, `--parallel` is **refused at construction** rather than silently running
+  unguarded.
+
+**Not covered — these pass silently:**
+
+- A bare `asyncio.run()` / `run_until_complete()` in a test body, and
+  `pytest-asyncio`.
+- `unittest.IsolatedAsyncioTestCase`. It overrides `_callTestMethod`, so the
+  blanket patch never applies and the guard is not merely blind but never entered.
+- `sync_to_async(..., thread_sensitive=False)` and a bare `threading.Thread`.
+- Plain pytest *function* tests under the mixin-less path — the patch targets
+  `unittest.TestCase._callTestMethod`, so only `TestCase` subclasses are hooked.
+
+There is no fix available from inside an `execute_wrapper`, so these are
+documented and pinned by tests in both directions rather than worked around.
+
+Note that **SQLite does not save you here**: Django rewrites a `":memory:"` test
+database to `file:memorydb_<alias>?mode=memory&cache=shared`, so another thread
+shares the same tables rather than finding an empty database.
+
+#### Two more things worth knowing before you adopt
+
+**`QueryGuardRunner` needs Django's test runner.** A project on pytest cannot set
+`TEST_RUNNER` and get blanket coverage; use `QueryGuardMixin`, which works under
+any runner that goes through `unittest.TestCase`.
+
+**Generate your first report serially.** Findings live in a module-global list,
+which is per *process*. `--parallel` workers are separate processes and nothing
+gathers their lists back, so report-only mode under `--parallel` prints a partial
+report per worker at pool teardown rather than one consolidated report. Enforcing
+mode is unaffected — failures travel home in the test result.
 
 #### Not yet extracted
 

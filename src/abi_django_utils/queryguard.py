@@ -87,18 +87,51 @@ Known limitation: off-main-thread ORM work
 ``execute_wrapper`` is registered on the connections this process holds, and
 Django's ``connections`` is thread-local. ORM work that runs on **another**
 thread therefore uses a connection the guard never wrapped, and is invisible to
-it. In practice that means:
+it.
 
-* ``async`` views, ``AsyncClient``, and Django's own async ORM (``async for``,
-  ``acreate``) **are** covered — asgiref's default thread-sensitive executor
-  runs them on the main thread, which is where the wrapper is. Measured, and
-  pinned by ``AsyncCoverageTests``.
-* ``sync_to_async(..., thread_sensitive=False)`` and a bare
-  ``threading.Thread`` are **not** covered.
+**The dividing line is how the event loop is entered, not sync versus async.**
+``sync_to_async``'s default ``thread_sensitive=True`` means "run on the thread
+the outer synchronous caller is on" — and when there is no outer synchronous
+caller it falls through to a shared single-worker ``ThreadPoolExecutor``
+instead. Measured on asgiref 3.11 / Django 6.0, thread-sensitive work lands on:
 
-On SQLite the uncovered case usually announces itself (a separate in-memory
-database has no tables); on PostgreSQL it is silent. There is no fix available
-from inside a wrapper, so this is documented rather than worked around.
+=========================================  ====================  =========
+entry point                                thread                covered
+=========================================  ====================  =========
+``async_to_sync(coro)()``                  ``MainThread``        yes
+Django ``async def test_*``                ``MainThread``        yes
+``asyncio.run(coro)``                      pool worker           **no**
+``asyncio.run`` + ``ThreadSensitiveContext``  pool worker        **no**
+=========================================  ====================  =========
+
+So, concretely:
+
+* **Covered:** sync tests; ``async`` views reached through ``AsyncClient``;
+  Django's own ``async def test_*`` methods, because ``SimpleTestCase`` wraps
+  them in ``async_to_sync`` before calling them; Django's async ORM
+  (``async for``, ``aget``) inside any of those.
+* **Not covered:** a bare ``asyncio.run()`` in a test body, ``pytest-asyncio``,
+  ``unittest.IsolatedAsyncioTestCase`` (which runs its own loop *and* overrides
+  ``_callTestMethod``, so the guard is never even entered),
+  ``sync_to_async(..., thread_sensitive=False)``, and a bare
+  ``threading.Thread``.
+
+The uncovered cases fail **silently** — the guard records an empty window and
+reports a pass. That includes on SQLite: Django's test database for
+``NAME = ":memory:"`` is ``file:memorydb_default?mode=memory&cache=shared``, so
+another thread shares the same tables rather than finding an empty database.
+There is no fix available from inside an ``execute_wrapper``, so this is
+documented and pinned by ``AsyncCoverageTests`` rather than worked around.
+
+Report-only mode under ``--parallel``
+-------------------------------------
+
+Findings are collected in a module-global list, which is per *process*.
+``--parallel`` workers are separate processes and nothing gathers their lists
+back, so report-only mode under ``--parallel`` yields a partial report per
+worker at pool teardown rather than one consolidated report. Enforcing mode is
+unaffected: failures travel home in the test result. Generate your first report
+serially.
 """
 
 from __future__ import annotations
@@ -137,14 +170,42 @@ _FINDINGS: list[tuple[str, dict[str, int]]] = []
 #: Collectors currently recording, so ``new_window()`` can reach them without
 #: being handed one. A list rather than a single slot because ``guarding()`` is
 #: re-entrant and the guard's own tests build collectors directly; under normal
-#: use it holds at most one. Guarded by ``_ACTIVE_LOCK`` because a thread that
-#: cannot be *measured* (see the module docstring) can still call
-#: ``new_window()``.
+#: use it holds at most one.
+#:
+#: ``_ACTIVE_LOCK`` protects **this registry only** — a thread whose queries
+#: cannot be measured can still call ``new_window()``, and iterating a list
+#: another thread is appending to is the one unsafe operation here that has no
+#: upside. A collector's own ``shapes``/``windows`` are deliberately left
+#: unsynchronised: the wrapper runs on whichever thread issued the query, and
+#: that thread is by definition one whose connection the guard wrapped, i.e. the
+#: same thread the test body is on. The worst case if that ever stops holding is
+#: a query attributed to the neighbouring window — a missed or invented finding,
+#: not corruption — and paying a lock per query to narrow it is the wrong
+#: trade in a test-only hot path.
 _ACTIVE: list[QueryCollector] = []
 _ACTIVE_LOCK = threading.Lock()
 
 #: Reported at most once per process — see ``warm_content_types``.
 _WARM_FAILURE_REPORTED = False
+
+
+def _forbidden_query_error() -> type[BaseException] | tuple[()]:
+    """Django's "no database queries in a SimpleTestCase" error.
+
+    Resolved by name because it is not part of Django's public API surface. A
+    tuple fallback of ``()`` is deliberate: ``except ()`` catches nothing, so if
+    Django ever moves it the warm falls through to the loud ``except`` below
+    rather than silently swallowing everything.
+    """
+    try:
+        from django.test.testcases import DatabaseOperationForbidden
+
+        return DatabaseOperationForbidden
+    except ImportError:  # pragma: no cover - only on an unexpected Django
+        return ()
+
+
+_ForbiddenQuery = _forbidden_query_error()
 
 
 def allow_repeats(count: int):
@@ -176,6 +237,12 @@ def is_select(sql: str) -> bool:
 
     Reads only: a repeated ``INSERT`` shape is an ordinary bulk write, and
     counting those makes routine fixture setup look like an N+1.
+
+    A prefix test, so it does not recognise a read that does not start with the
+    word: ``WITH ... SELECT`` (what ``django-cte`` and some ``RawSQL`` emit) and
+    ``EXPLAIN`` are both missed. Widening it is a behaviour change for existing
+    adopters — a previously-invisible shape starts failing tests — so it belongs
+    behind a setting rather than in a patch release.
     """
     return sql.lstrip().upper().startswith("SELECT")
 
@@ -255,9 +322,12 @@ def new_window():
 
     Banks on both entry and exit, exactly as the request signals do, so the work
     inside is counted on its own and is not charged to whatever ran before or
-    after it. Safe to call with no guard active — it is then a no-op, which is
-    what lets production code use it unconditionally if that reads better than
-    confining it to tests.
+    after it.
+
+    Safe to call with no guard active — it is then a no-op — so a helper shared
+    between a test and a management command can use it unconditionally. That is
+    not an invitation to import this module from production code: it pulls
+    ``django.test.runner`` and registers an ``atexit`` hook at import.
     """
     _bank_all()
     try:
@@ -367,10 +437,23 @@ def warm_content_types(test) -> None:
         from django.contrib.contenttypes.models import ContentType
 
         manager = ContentType.objects
-        if manager.db not in getattr(test, "databases", {"default"}):
+        # A set, not a bare string: `databases` is normally a frozenset by the
+        # time setUpClass has run, but it is spelled `"__all__"` in source and
+        # `"default" not in "__all__"` is a substring test that answers True.
+        declared = getattr(test, "databases", {"default"})
+        if isinstance(declared, str):
+            declared = {declared}
+        if declared != {"__all__"} and manager.db not in declared:
             return
         for content_type in manager.all():
             manager._add_to_cache(manager.db, content_type)
+    except _ForbiddenQuery:
+        # An ancestor `SimpleTestCase` installed the "no queries here" patch and
+        # it is still in force, so this test cannot be warmed however its own
+        # `databases` reads. Ordinary configuration, not a surprise: reporting it
+        # would make the loud `except` below mean "this ran normally", which is
+        # exactly what it must not mean.
+        return
     except Exception as exc:  # pragma: no cover - defensive
         # Loud, because a silent no-op here restores the false positive this
         # prevents. Once, because it would otherwise be once per test.
@@ -418,9 +501,23 @@ def guarding(test):
 
 
 def threshold_for(test) -> int:
-    """The repeat threshold for this test, honouring ``@allow_repeats``."""
-    test_method = getattr(test, getattr(test, "_testMethodName", ""), None)
-    return getattr(test_method, "_allow_repeats", default_threshold())
+    """The repeat threshold for this test, honouring ``@allow_repeats``.
+
+    Read off the **class**, not the instance, because Django replaces the
+    instance attribute for a coroutine test: ``SimpleTestCase._setup_and_call``
+    does ``setattr(self, name, async_to_sync(testMethod))``, and that
+    ``AsyncToSync`` wrapper does not carry ``_allow_repeats``. Reading the
+    instance therefore silently ignored the decorator on every ``async def
+    test_*``, and the failure it produced told the author to add the decorator
+    they had already added.
+
+    The class attribute is the undecorated function in both cases, so it answers
+    for sync and async alike — a mutation round confirmed the instance read it
+    replaced was contributing nothing.
+    """
+    name = getattr(test, "_testMethodName", "")
+    method = getattr(type(test), name, None)
+    return getattr(method, "_allow_repeats", default_threshold())
 
 
 def check(test, collector: QueryCollector, *, completed: bool = True) -> None:
@@ -428,17 +525,27 @@ def check(test, collector: QueryCollector, *, completed: bool = True) -> None:
 
     ``completed`` is False when the test body raised — a failure, an error, or
     an in-body ``self.skipTest()``. Such a run measured only the queries made
-    before it stopped, which is *fewer* than the test earns, so adding a second
-    failure on top of the real one buries the cause. Decorator skips
-    (``@skipIf``, ``@unittest.skip``) never reach here at all, because
-    ``_callTestMethod`` is not called for them.
+    before it stopped, so it is an *under*-count, never an over-count.
+
+    That asymmetry is why the two modes treat it differently. Enforcing mode
+    stays quiet: adding a second failure on top of the real one buries the cause.
+    Report-only mode still records it, because the report is informational and
+    cannot make a failing test worse — and dropping it means a test that N+1s and
+    *then* fails for an unrelated reason contributes nothing to the triage list
+    the rollout is built on, so the finding reappears only once the unrelated
+    failure is fixed.
+
+    Decorator skips (``@skipIf``, ``@unittest.skip``) never reach here at all,
+    because ``_callTestMethod`` is not called for them.
     """
     threshold = threshold_for(test)
     offenders = collector.repeated(threshold)
-    if not offenders or not completed:
+    if not offenders:
         return
     if report_only():
         _FINDINGS.append((test.id(), offenders))
+        return
+    if not completed:
         return
     fail_with(test, test.id(), threshold, offenders)
 
@@ -507,15 +614,37 @@ class QueryGuardRunner(DiscoverRunner):
 
     parallel_test_suite = GuardedParallelTestSuite
 
-    def run_suite(self, suite, **kwargs):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Here rather than in `run_suite`, which Django reaches only after
+        # `setup_databases` has cloned one test database per worker. The verdict
+        # is the same either way; refusing before the clones saves the minutes.
         if getattr(self, "parallel", 0) > 1:
             self._require_parallel_support()
+
+    def run_suite(self, suite, **kwargs):
         original = install()
         try:
             return super().run_suite(suite, **kwargs)
         finally:
             unittest.TestCase._callTestMethod = original
+            self._report()
+
+    def _report(self) -> None:
+        """Emit the findings, or say the guard ran and found none.
+
+        The clean case needs saying. ``emit_report()`` returns early with no
+        findings, so without this a run with the guard installed and a run with
+        ``TEST_RUNNER`` misspelled print exactly the same thing — and the whole
+        point of a blanket detector is that nobody is annotating anything, so
+        there is no other evidence it was active.
+        """
+        if _FINDINGS:
             emit_report()
+            return
+        if not report_only():
+            return
+        print("query guard: active, no repeated query shapes detected", file=sys.stderr, flush=True)
 
     @staticmethod
     def _require_parallel_support() -> None:

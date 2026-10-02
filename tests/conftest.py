@@ -23,7 +23,13 @@ def pytest_configure():
     settings.configure(
         DEBUG=False,
         ALLOWED_HOSTS=["testserver"],
-        DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
+        # Two aliases, because the guard enters `execute_wrapper` for every one
+        # of them and with a single alias that loop body runs exactly once in the
+        # whole suite -- which 100% line coverage cannot distinguish from working.
+        DATABASES={
+            "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"},
+            "secondary": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"},
+        },
         INSTALLED_APPS=[
             "django.contrib.auth",
             "django.contrib.contenttypes",

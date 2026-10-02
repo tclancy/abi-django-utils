@@ -11,15 +11,19 @@ The inner classes are ``SimpleTestCase`` with ``databases`` opened rather than
 test's. Their writes are rolled back by the outer ``TestCase`` regardless.
 """
 
+import asyncio
+import contextlib
 import io
 import threading
 import unittest
+from contextlib import ExitStack
 
 import pytest
 from asgiref.sync import async_to_sync, sync_to_async
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ImproperlyConfigured
 from django.core.signals import request_finished, request_started
+from django.db import connections
 from django.test import AsyncClient, Client, SimpleTestCase, TestCase, override_settings
 
 from abi_django_utils import queryguard
@@ -57,10 +61,15 @@ def _isolate_module_state():
     one's assertion, and the suite prints a spurious report at exit.
     """
     queryguard._FINDINGS.clear()
-    queryguard._ACTIVE.clear()
+    for leaked in list(queryguard._ACTIVE):
+        leaked.close()
     yield
     queryguard._FINDINGS.clear()
-    queryguard._ACTIVE.clear()
+    # close(), not clear(): a collector left in the registry still holds live
+    # `request_started`/`request_finished` receivers, and clearing the list
+    # would hide that leak instead of undoing it.
+    for leaked in list(queryguard._ACTIVE):
+        leaked.close()
 
 
 def collect(*statements, boundaries=()):
@@ -77,9 +86,15 @@ def collect(*statements, boundaries=()):
 
 
 def run_inner(cls, method_name="runTest"):
-    """Run one inner test method and hand back unittest's result object."""
+    """Run one inner test method and hand back unittest's result object.
+
+    ``testsRun`` is asserted here rather than in each caller: every
+    ``wasSuccessful()`` assertion below would otherwise also pass on an inner
+    test that never ran.
+    """
     result = unittest.TestResult()
     unittest.TestSuite([cls(method_name)]).run(result)
+    assert result.testsRun == 1, f"inner test did not run: {result.testsRun}"
     return result
 
 
@@ -581,13 +596,18 @@ class RequestWindowIntegrationTests(TestCase):
 
 @override_settings(QUERY_GUARD_REPORT_ONLY=False)
 class AsyncCoverageTests(TestCase):
-    """Pins the module docstring's claims about async and about threads.
+    """Pins where the guard can and cannot see, in both directions.
 
-    The gap list on the extraction ticket called async "untested". It turns out
-    async is not the axis that matters: asgiref's default thread-sensitive
-    executor runs ORM work on the main thread, which is where the wrapper is, so
-    async views are covered. What is *not* covered is ORM work on another
-    thread, and that is reachable from plain sync code too.
+    The extraction ticket's gap list called async "untested". Measuring it found
+    the gap mis-stated twice over. Async is not the axis: ``sync_to_async``'s
+    default ``thread_sensitive=True`` means "the thread the outer *synchronous*
+    caller is on", so what decides coverage is whether the event loop was entered
+    through ``async_to_sync`` — and when it was not, thread-sensitive work goes to
+    a shared pool worker whose connection the guard never wrapped.
+
+    Every "not covered" test here has a "covered" control beside it, because an
+    assertion that nothing was recorded passes just as well on a collector that
+    records nothing at all.
     """
 
     def test_an_nplusone_in_an_async_view_is_caught(self):
@@ -627,24 +647,121 @@ class AsyncCoverageTests(TestCase):
 
         assert "queryguard_app_author" in only_failure(run_inner(Inner))
 
+    def test_an_async_def_test_method_is_covered(self):
+        # Django wraps a coroutine test in async_to_sync before calling it
+        # (SimpleTestCase._setup_and_call), which is what puts it on the main
+        # thread and therefore inside the guard.
+        seed_books()
+
+        class Inner(QueryGuardMixin, SimpleTestCase):
+            databases = {"default"}
+
+            async def runTest(self):
+                await sync_to_async(touch_authors)()
+
+        assert "queryguard_app_author" in only_failure(run_inner(Inner))
+
+    def test_allow_repeats_works_on_an_async_test_method(self):
+        # Django replaces the *instance* attribute with an AsyncToSync wrapper
+        # that carries no _allow_repeats, so reading only the instance attribute
+        # ignored the decorator and then told the author to add it.
+        seed_books(3)
+
+        class Inner(QueryGuardMixin, SimpleTestCase):
+            databases = {"default"}
+
+            @allow_repeats(3)
+            async def runTest(self):
+                await sync_to_async(touch_authors)()
+
+        assert run_inner(Inner).wasSuccessful()
+
+    def test_an_undecorated_async_test_method_still_fails(self):
+        # The control for the test above: without the decorator the same body is
+        # a finding, so the pass up there is the decorator working rather than the
+        # guard having gone blind on coroutine tests.
+        seed_books(3)
+
+        class Inner(QueryGuardMixin, SimpleTestCase):
+            databases = {"default"}
+
+            async def runTest(self):
+                await sync_to_async(touch_authors)()
+
+        assert "repeated query shape" in only_failure(run_inner(Inner))
+
+    def test_a_bare_asyncio_run_is_not_covered(self):
+        # No outer synchronous caller, so thread-sensitive work falls through to
+        # a shared single-worker pool rather than staying on this thread. The
+        # off-thread query may succeed or raise depending on whether the
+        # enclosing transaction has the table locked -- Django's test database
+        # for ":memory:" is `cache=shared`, so it is the SAME database, not an
+        # empty one. Either way the guard records nothing, and that is the claim.
+        seed_books()
+
+        async def repeat_a_shape():
+            await sync_to_async(touch_authors)()
+            await sync_to_async(touch_authors)()
+
+        collector = QueryCollector()
+        try:
+            with ExitStack() as stack:
+                for connection in connections.all():
+                    stack.enter_context(connection.execute_wrapper(collector))
+                with contextlib.suppress(Exception):
+                    asyncio.run(repeat_a_shape())
+        finally:
+            collector.close()
+        assert collector.windows == [[]], f"expected nothing recorded, got {collector.windows}"
+
+    def test_the_same_work_entered_through_async_to_sync_is_covered(self):
+        # The control. Identical coroutine, identical ORM calls; only the entry
+        # point differs, which is the whole point of the table in the docstring.
+        seed_books()
+
+        async def repeat_a_shape():
+            await sync_to_async(touch_authors)()
+            await sync_to_async(touch_authors)()
+
+        collector = QueryCollector()
+        try:
+            with ExitStack() as stack:
+                for connection in connections.all():
+                    stack.enter_context(connection.execute_wrapper(collector))
+                async_to_sync(repeat_a_shape)()
+        finally:
+            collector.close()
+        assert collector.repeated(1), "async_to_sync keeps the work on this thread and must be seen"
+
+    def test_isolated_asyncio_test_case_is_not_hooked_at_all(self):
+        # Worse than blind: `install()` patches `unittest.TestCase`, and
+        # IsolatedAsyncioTestCase overrides `_callTestMethod` in its own class
+        # dict, so the guard is never entered and nothing warns. Pinned
+        # structurally -- if a future Python stops overriding it, this goes red
+        # and the documented limitation needs revisiting rather than quietly
+        # becoming wrong in the other direction.
+        assert "_callTestMethod" in vars(unittest.IsolatedAsyncioTestCase)
+        original = install()
+        try:
+            assert unittest.TestCase._callTestMethod is not original
+            assert unittest.IsolatedAsyncioTestCase._callTestMethod is not (unittest.TestCase._callTestMethod)
+        finally:
+            unittest.TestCase._callTestMethod = original
+
     def test_off_main_thread_orm_work_is_invisible(self):
-        # Documented limitation, pinned so it changes deliberately rather than
-        # by accident. Django's `connections` is thread-local, so a non
-        # thread-sensitive executor uses a connection the guard never wrapped.
-        # On SQLite that means a separate empty in-memory database, which is why
-        # the probe counts rows instead of comparing them.
+        # Documented limitation, pinned so it changes deliberately rather than by
+        # accident. Django's `connections` is thread-local, so another thread
+        # uses a connection the guard never wrapped.
         seed_books()
         collector = QueryCollector()
         try:
-            errors = []
 
             def query():
                 from django.db import connections as thread_connections
 
                 try:
-                    touch_authors()
-                except Exception as exc:  # noqa: BLE001 - the point is that it is not ours
-                    errors.append(exc)
+                    with contextlib.suppress(Exception):
+                        touch_authors()
                 finally:
                     # This thread opened a connection of its own -- which is the
                     # finding -- and nothing else will ever close it.
@@ -662,7 +779,6 @@ class AsyncCoverageTests(TestCase):
         finally:
             collector.close()
         assert collector.windows == [[]], "the guard is not supposed to see another thread's queries"
-        assert errors, "expected SQLite's separate in-memory database to refuse the query"
 
     def test_a_thread_sensitive_executor_is_visible(self):
         # The control for the test above: same shape of call, default executor,
@@ -671,10 +787,6 @@ class AsyncCoverageTests(TestCase):
         seed_books()
         collector = QueryCollector()
         try:
-            from contextlib import ExitStack
-
-            from django.db import connections
-
             with ExitStack() as stack:
                 for connection in connections.all():
                     stack.enter_context(connection.execute_wrapper(collector))
@@ -876,6 +988,205 @@ class RunnerTests(SimpleTestCase):
         assert called == []
 
 
+@override_settings(QUERY_GUARD_REPORT_ONLY=False)
+class RealRunnerTests(TestCase):
+    """Runs a real suite through ``QueryGuardRunner``, not a mocked one.
+
+    Every other runner test above mocks ``TextTestRunner.run``, which asserts the
+    wiring and nothing about the outcome. This is the only test in the repo where
+    the library's headline entry point actually causes a test to fail.
+    """
+
+    def _suite(self):
+        books = Book.objects.count()
+        assert books, "fixture missing"
+
+        class Planted(SimpleTestCase):
+            databases = {"default"}
+
+            def test_nplusone(self):
+                touch_authors()
+
+        class Clean(SimpleTestCase):
+            databases = {"default"}
+
+            def test_eager(self):
+                touch_authors_eagerly()
+
+        return unittest.TestSuite([Planted("test_nplusone"), Clean("test_eager")])
+
+    def test_the_runner_fails_the_planted_test_and_passes_the_clean_one(self):
+        seed_books()
+        stderr = io.StringIO()
+        with unittest.mock.patch("sys.stderr", stderr):
+            result = QueryGuardRunner().run_suite(self._suite())
+        assert result.testsRun == 2
+        assert result.errors == [], result.errors
+        assert len(result.failures) == 1, result.failures
+        failed_test, message = result.failures[0]
+        assert failed_test._testMethodName == "test_nplusone"
+        assert "repeated query shape" in message
+        assert "queryguard_app_author" in message
+
+    def test_the_runner_restores_the_patch_after_a_real_run(self):
+        seed_books()
+        original = unittest.TestCase._callTestMethod
+        with unittest.mock.patch("sys.stderr", io.StringIO()):
+            QueryGuardRunner().run_suite(self._suite())
+        assert unittest.TestCase._callTestMethod is original
+
+    @override_settings(QUERY_GUARD_REPORT_ONLY=True)
+    def test_a_clean_run_says_the_guard_was_active(self):
+        # Otherwise a run with the guard installed and a run with TEST_RUNNER
+        # misspelled print exactly the same thing, and since nothing is annotated
+        # there is no other evidence it was on.
+        seed_books()
+
+        class Clean(SimpleTestCase):
+            databases = {"default"}
+
+            def test_eager(self):
+                touch_authors_eagerly()
+
+        stderr = io.StringIO()
+        with unittest.mock.patch("sys.stderr", stderr):
+            QueryGuardRunner().run_suite(unittest.TestSuite([Clean("test_eager")]))
+        assert "query guard: active, no repeated query shapes detected" in stderr.getvalue()
+
+    @override_settings(QUERY_GUARD_REPORT_ONLY=True)
+    def test_a_run_with_findings_prints_them_instead_of_the_clean_line(self):
+        seed_books()
+        stderr = io.StringIO()
+        with unittest.mock.patch("sys.stderr", stderr):
+            QueryGuardRunner().run_suite(self._suite())
+        printed = stderr.getvalue()
+        assert "repeated query shapes" in printed
+        assert "no repeated query shapes detected" not in printed
+
+    def test_enforcing_mode_prints_no_clean_line(self):
+        # In enforcing mode a green suite IS the evidence, and an extra line on
+        # every CI run is noise.
+        seed_books()
+
+        class Clean(SimpleTestCase):
+            databases = {"default"}
+
+            def test_eager(self):
+                touch_authors_eagerly()
+
+        stderr = io.StringIO()
+        with unittest.mock.patch("sys.stderr", stderr):
+            QueryGuardRunner().run_suite(unittest.TestSuite([Clean("test_eager")]))
+        assert "query guard:" not in stderr.getvalue()
+
+    def test_parallel_is_refused_at_construction_not_at_run_time(self):
+        # Django reaches run_suite only after setup_databases has cloned one test
+        # database per worker, so a refusal there is correct and wasteful.
+        import builtins
+
+        real_import = builtins.__import__
+
+        def no_init_worker(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "django.test.runner" and "_init_worker" in (fromlist or ()):
+                raise ImportError("no _init_worker")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with unittest.mock.patch.object(builtins, "__import__", no_init_worker):
+            with pytest.raises(ImproperlyConfigured):
+                QueryGuardRunner(parallel=4)
+
+
+@override_settings(QUERY_GUARD_REPORT_ONLY=False)
+class MultipleDatabaseTests(TestCase):
+    """The gap the extraction ticket declares closed, actually exercised.
+
+    ``guarding()`` enters ``execute_wrapper`` for every alias in
+    ``connections.all()``. With one alias configured that loop body runs exactly
+    once in the whole suite, and 100% line coverage cannot tell that apart from
+    multi-database working.
+    """
+
+    databases = {"default", "secondary"}
+
+    def test_an_nplusone_on_a_secondary_alias_is_caught(self):
+        author = Author.objects.using("secondary").create(name="Ursula")
+        for index in range(3):
+            Book.objects.using("secondary").create(title=f"b{index}", author=author)
+
+        class Inner(QueryGuardMixin, SimpleTestCase):
+            databases = {"default", "secondary"}
+
+            def runTest(self):
+                for book in Book.objects.using("secondary").all():
+                    book.author.name
+
+        assert "queryguard_app_author" in only_failure(run_inner(Inner))
+
+    def test_a_clean_query_on_a_secondary_alias_passes(self):
+        author = Author.objects.using("secondary").create(name="Ursula")
+        for index in range(3):
+            Book.objects.using("secondary").create(title=f"b{index}", author=author)
+
+        class Inner(QueryGuardMixin, SimpleTestCase):
+            databases = {"default", "secondary"}
+
+            def runTest(self):
+                for book in Book.objects.using("secondary").select_related("author"):
+                    book.author.name
+
+        assert run_inner(Inner).wasSuccessful()
+
+    def test_every_configured_alias_is_wrapped(self):
+        class Inner(SimpleTestCase):
+            databases = {"default", "secondary"}
+
+            def runTest(self):
+                pass
+
+        inner = Inner("runTest")
+        with guarding(inner) as collector:
+            for alias in ("default", "secondary"):
+                assert collector in connections[alias].execute_wrappers, alias
+
+
+class IncompleteRunTests(TestCase):
+    """What a body that raised contributes, per mode."""
+
+    @override_settings(QUERY_GUARD_REPORT_ONLY=True)
+    def test_report_only_still_records_a_test_that_failed_for_another_reason(self):
+        # The report is informational and cannot make a failing test worse.
+        # Dropping it means the triage list the rollout is built on silently
+        # under-reports, and the finding reappears only once the unrelated
+        # failure is fixed.
+        seed_books()
+
+        class Inner(QueryGuardMixin, SimpleTestCase):
+            databases = {"default"}
+
+            def runTest(self):
+                touch_authors()
+                self.fail("something unrelated")
+
+        result = run_inner(Inner)
+        assert "something unrelated" in only_failure(result)
+        assert [test_id for test_id, _ in queryguard._FINDINGS] == [Inner("runTest").id()]
+
+    @override_settings(QUERY_GUARD_REPORT_ONLY=False)
+    def test_enforcing_mode_does_not_pile_a_second_failure_on_the_first(self):
+        seed_books()
+
+        class Inner(QueryGuardMixin, SimpleTestCase):
+            databases = {"default"}
+
+            def runTest(self):
+                touch_authors()
+                self.fail("something unrelated")
+
+        message = only_failure(run_inner(Inner))
+        assert "something unrelated" in message
+        assert "repeated query shape" not in message
+
+
 class WarmContentTypesTests(TestCase):
     """The false positive that only appears when a module runs in isolation."""
 
@@ -972,6 +1283,99 @@ class WarmContentTypesTests(TestCase):
         after = set(ContentType.objects.values_list("app_label", "model"))
         assert ("queryguard_app", "book") not in after
         assert after < before
+
+    def test_a_forbidden_query_patch_is_not_reported_as_a_surprise(self):
+        # A SimpleTestCase ancestor installs "no queries here" in setUpClass and
+        # it stays in force while a hand-built inner case runs, so the inner
+        # case's own `databases` does not re-enable the connection. That is
+        # ordinary configuration: reporting it would make the loud `except` below
+        # mean "this ran normally", which is exactly what it must not mean. This
+        # fired on every run of this very suite before it was handled.
+        from django.test.testcases import DatabaseOperationForbidden
+
+        class Inner(SimpleTestCase):
+            databases = {"default"}
+
+            def runTest(self):
+                pass
+
+        stderr = io.StringIO()
+        with unittest.mock.patch.object(
+            ContentType.objects.__class__,
+            "all",
+            side_effect=DatabaseOperationForbidden("nope"),
+        ):
+            with unittest.mock.patch("sys.stderr", stderr):
+                warm_content_types(Inner("runTest"))
+        assert stderr.getvalue() == ""
+
+    def test_an_unexpected_failure_is_reported_once(self):
+        # The other arm: anything that is NOT the forbidden-query patch must be
+        # loud, because a silent no-op here restores the false positive the warm
+        # exists to prevent.
+        queryguard._WARM_FAILURE_REPORTED = False
+
+        class Inner(SimpleTestCase):
+            databases = {"default"}
+
+            def runTest(self):
+                pass
+
+        stderr = io.StringIO()
+        try:
+            with unittest.mock.patch.object(ContentType.objects.__class__, "all", side_effect=RuntimeError("boom")):
+                with unittest.mock.patch("sys.stderr", stderr):
+                    warm_content_types(Inner("runTest"))
+                    first = stderr.getvalue()
+                    warm_content_types(Inner("runTest"))
+        finally:
+            queryguard._WARM_FAILURE_REPORTED = False
+        assert "could not warm the ContentType cache" in first
+        assert "RuntimeError: boom" in first
+        # Once per process, not once per test.
+        assert stderr.getvalue() == first
+
+    def test_the_forbidden_query_fallback_catches_nothing(self):
+        # `except ()` catches nothing on purpose: if Django ever moves
+        # DatabaseOperationForbidden, the warm must fall through to the loud
+        # `except Exception` rather than silently swallowing every failure. The
+        # obvious fallback -- `Exception` -- would do exactly the latter.
+        import builtins
+
+        real_import = builtins.__import__
+
+        def no_forbidden(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "django.test.testcases" and "DatabaseOperationForbidden" in (fromlist or ()):
+                raise ImportError("moved")
+            return real_import(name, globals, locals, fromlist, level)
+
+        with unittest.mock.patch.object(builtins, "__import__", no_forbidden):
+            assert queryguard._forbidden_query_error() == ()
+
+    def test_the_forbidden_query_sentinel_resolves_on_this_django(self):
+        # The control: the fallback above is only correct BECAUSE the real path
+        # works here. Without this, a permanently-broken import would read as a
+        # passing test.
+        from django.test.testcases import DatabaseOperationForbidden
+
+        assert queryguard._forbidden_query_error() is DatabaseOperationForbidden
+        assert queryguard._ForbiddenQuery is DatabaseOperationForbidden
+
+    def test_a_databases_string_is_not_substring_matched(self):
+        # `databases` is spelled "__all__" in source and is normally a frozenset
+        # by the time setUpClass has run -- but `"default" not in "__all__"` is a
+        # substring test that answers True, which would skip the warm.
+        ContentType.objects.clear_cache()
+
+        class Inner(SimpleTestCase):
+            databases = "__all__"
+
+            def runTest(self):
+                pass
+
+        warm_content_types(Inner("runTest"))
+        with self.assertNumQueries(0):
+            ContentType.objects.get_for_model(Author)
 
     def test_it_does_not_query_when_contenttypes_is_not_installed(self):
         # Asserting only that nothing was printed would pass with the guard
