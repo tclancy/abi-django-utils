@@ -222,6 +222,10 @@ QUERY_GUARD_UPDATE_BASELINE=1 manage.py test   # writes the file; commit it
   longer earned **fails**, naming the entries. Otherwise a fix tightens the ratchet
   without the file following, and the next PR to regenerate ships deletions nobody
   in it caused. Report-only mode keeps that as a note.
+- **The baseline needs `QueryGuardRunner`.** Writing it, carrying entries, and the
+  stale gate all live on the runner, so none of them happen under `QueryGuardMixin`
+  alone. Setting `QUERY_GUARD_UPDATE_BASELINE` with no runner active says so on
+  stderr rather than quietly collecting instead of enforcing.
 - **Readable in a diff**, which is the whole value of the file: sorted, indented,
   and naming the SQL, so a review sees *which* query a fix removed.
 - **No default path**, deliberately. This module lives in your virtualenv, so a
@@ -256,10 +260,16 @@ covering, it stays, the ceiling stays raised, and a new repeat of any shape in t
 test is silently inside it.
 
 `@expect_repeats` is the same allowance **plus an assertion that it is still
-needed** — fix the N+1 and the test fails, naming the decorator to remove. It
-counts repeats rather than shapes, so it cannot tell "this N+1" from "an N+1 of the
-same depth"; for shape-level pinning use the baseline, which records the SQL. The
-two compose: a baselined test may also carry the decorator. Unlike a blanket
+needed** — fix the N+1 and the test fails, naming the decorator to remove.
+
+The pin is **exact in both directions**: the count is the allowance as well as the
+assertion, so a repeat that gets *deeper* fails too, with a message naming this
+decorator rather than telling you to add `@allow_repeats`. A change in either
+direction is worth a reader's attention.
+
+It counts repeats rather than shapes, so it cannot tell "this N+1" from "an N+1 of
+the same depth"; for shape-level pinning use the baseline, which records the SQL.
+The two compose: a baselined test may also carry the decorator. Unlike a blanket
 finding, `@expect_repeats` fails in report-only mode too — it is an assertion you
 wrote by hand about one test, not a detector sweeping an untriaged suite.
 

@@ -84,6 +84,7 @@ def _isolate_module_state():
     queryguard._OBSERVATIONS = 0
     queryguard._RUN_ACTIVE = False
     queryguard._RUN_BASELINE_PATH = None
+    queryguard._UPDATE_WITHOUT_RUNNER_REPORTED = False
     os.environ.pop("QUERY_GUARD_UPDATE_BASELINE", None)
     for leaked in list(queryguard._ACTIVE):
         leaked.close()
@@ -93,6 +94,7 @@ def _isolate_module_state():
     queryguard._OBSERVATIONS = 0
     queryguard._RUN_ACTIVE = False
     queryguard._RUN_BASELINE_PATH = None
+    queryguard._UPDATE_WITHOUT_RUNNER_REPORTED = False
     os.environ.pop("QUERY_GUARD_UPDATE_BASELINE", None)
     # close(), not clear(): a collector left in the registry still holds live
     # `request_started`/`request_finished` receivers, and clearing the list
@@ -1684,9 +1686,17 @@ class CarryableBaselineTests(SimpleTestCase):
         # The one path whose job is to be forgiving must not silently absorb a
         # genuine defect in the parser as "one more bad entry".
         with baseline_file({"a": {SELECT_AUTHOR: 2}}):
-            with unittest.mock.patch.object(queryguard, "_parse_entry", side_effect=ValueError("parser bug")):
-                with pytest.raises(ValueError):
-                    carryable_baseline()
+            # `RuntimeError`, not some unrelated class. `UnreadableBaselineEntry` IS
+            # a RuntimeError, so a widened `except RuntimeError:` here is the exact
+            # regression the docstring promises against -- and a ValueError probe
+            # passes under that widening, which makes the assertion say nothing
+            # about the thing it names. The ValueError case is kept beside it only
+            # to show the narrow except is not catching by accident.
+            for injected in (RuntimeError("parser bug"), ValueError("parser bug")):
+                with self.subTest(injected=type(injected).__name__):
+                    with unittest.mock.patch.object(queryguard, "_parse_entry", side_effect=injected):
+                        with pytest.raises(type(injected)):
+                            carryable_baseline()
 
 
 class UnbaselinedShapesTests(SimpleTestCase):
@@ -1870,7 +1880,7 @@ def one_shape(shapes, table):
     return next(iter(matching.items()))
 
 
-def baselined_case(body, decorator=None):
+def baselined_case(body):
     """A guarded case whose ``id()`` is one ``baselinable()`` accepts.
 
     Every other inner class in this file reports an id containing ``<locals>``,
@@ -1887,7 +1897,7 @@ def baselined_case(body, decorator=None):
         def id(self):
             return BASELINED_ID
 
-        runTest = decorator(body) if decorator else body
+        runTest = body
 
     return Baselined
 
@@ -1921,7 +1931,14 @@ class BaselinedEnforcementTests(TestCase):
         seed_books()
         with baseline_file():
             result = run_inner(baselined_case(plant_nplusone))
-        assert "repeated query shape" in only_failure(result)
+        message = only_failure(result)
+        assert "repeated query shape" in message
+        # An undecorated test gets the advice that names what to ADD. The pinned
+        # branch beside it reads `expected_repeats_for`, which is None here, so
+        # taking that branch unconditionally would print "@expect_repeats(None)" --
+        # and every assertion in this class passes on that.
+        assert "@allow_repeats(n)" in message
+        assert "@expect_repeats(None)" not in message
 
     def test_a_recorded_repeat_that_got_worse_fails(self):
         seed_books()
@@ -1980,6 +1997,12 @@ class BaselinedEnforcementTests(TestCase):
         # Otherwise the regeneration command is itself red: the positive controls
         # assert the inner test fails, and collecting instead of failing makes every
         # one of them report a pass.
+        #
+        # `_RUN_ACTIVE` has to be set here or this test says nothing. Adding that
+        # term to `collecting` for the mixin finding above made the whole condition
+        # False on the variable alone, so the `baselinable` term it was written about
+        # stopped being reached -- the test kept passing and a mutation round caught
+        # it. A refactor voids a guarantee written against the old shape.
         seed_books()
 
         class Inner(QueryGuardMixin, SimpleTestCase):
@@ -1988,18 +2011,53 @@ class BaselinedEnforcementTests(TestCase):
             def runTest(self):
                 touch_authors()
 
-        with baseline_file(), updating():
+        with baseline_file() as path, updating():
+            queryguard._RUN_ACTIVE = True
+            queryguard._RUN_BASELINE_PATH = path
             result = run_inner(Inner)
         assert "repeated query shape" in only_failure(result)
 
     def test_a_baselinable_test_IS_excused_by_an_update_run(self):
         # The control for the two above: an update run has to collect rather than
-        # fail, or regeneration is impossible.
+        # fail, or regeneration is impossible. Needs a runner — see the test below
+        # for why the bare environment variable is not enough.
         seed_books()
-        with baseline_file(), updating():
+        with baseline_file() as path, updating():
+            queryguard._RUN_ACTIVE = True
+            queryguard._RUN_BASELINE_PATH = path
             result = run_inner(baselined_case(plant_nplusone))
         assert result.wasSuccessful(), result.failures
         assert [test_id for test_id, _ in queryguard._FINDINGS] == [BASELINED_ID]
+
+    def test_the_update_variable_alone_does_not_excuse_anything(self):
+        # Only the runner writes the baseline, so under the mixin an update run
+        # would have collected instead of enforcing, written nothing, and said
+        # nothing — a green suite, no file, no diagnostic, which is exactly the
+        # "green that reads as a checked green" the runner refuses outright. An
+        # environment variable left exported in a shell is how this gets reached.
+        seed_books()
+        with baseline_file() as path, updating():
+            result = run_inner(baselined_case(plant_nplusone))
+            assert not path.exists(), "nothing should have been written"
+        assert "repeated query shape" in only_failure(result)
+
+    def test_it_says_so_once_rather_than_once_per_test(self):
+        seed_books()
+        stderr = io.StringIO()
+        with baseline_file(), updating(), unittest.mock.patch("sys.stderr", stderr):
+            run_inner(baselined_case(plant_nplusone))
+            first = stderr.getvalue()
+            run_inner(baselined_case(plant_nplusone))
+        assert "no QueryGuardRunner is active" in first
+        assert stderr.getvalue() == first
+
+    def test_a_run_WITH_a_runner_does_not_warn(self):
+        # The control: a warning on the ordinary regeneration path would train the
+        # reader to ignore it.
+        seed_books()
+        with baseline_file(), updating():
+            _, printed = run_through_runner(QueryGuardRunner(), guarded_suite(nplusone_case("tests.m.C.test_a")))
+        assert "no QueryGuardRunner is active" not in printed
 
 
 class ExpectRepeatsTests(TestCase):
@@ -2123,7 +2181,13 @@ class ExpectRepeatsTests(TestCase):
 
         message = only_failure(run_inner(Inner))
         assert "repeated query shape" in message
-        assert "@expect_repeats" not in message
+        # And the message names the decorator the author ALREADY wrote, rather than
+        # prescribing @allow_repeats. The earlier version of this test asserted the
+        # opposite -- pinning the unhelpful message in place -- which is the exact
+        # defect this module's own history records one layer up: "the failure it
+        # produced told the author to add the decorator they had already added."
+        assert "@expect_repeats(2)" in message
+        assert "@allow_repeats" not in message
 
     @override_settings(QUERY_GUARD_REPORT_ONLY=False)
     def test_a_partial_fix_still_fails_the_expectation(self):
@@ -2284,6 +2348,16 @@ class UpdateRunTests(TestCase):
             result, _ = run_through_runner(QueryGuardRunner(), guarded_suite(nplusone_case("tests.m.C.test_a")))
         assert result.wasSuccessful(), result.failures
 
+    def test_the_footer_describes_the_update_run_end_to_end(self):
+        # Through the runner in ENFORCING mode, which is the configuration a project
+        # regenerating its baseline is actually in -- and the one where the
+        # report-only wording was a flat contradiction of the run.
+        seed_books()
+        with baseline_file(), updating():
+            _, printed = run_through_runner(QueryGuardRunner(), guarded_suite(nplusone_case("tests.m.C.test_a")))
+        assert "Recorded in the baseline" in printed
+        assert "Report-only mode" not in printed
+
     def test_a_clean_test_earns_no_entry(self):
         seed_books()
         with baseline_file() as path, updating():
@@ -2348,6 +2422,32 @@ class UpdateRunTests(TestCase):
         message = str(caught.value)
         assert "observed no tests" in message
         assert REGENERATE_COMMAND in message
+
+    def test_a_prior_observation_does_not_excuse_an_empty_update_run(self):
+        # The refusal depends on the *delta*, not the absolute count. The test above
+        # passes on an absolute count too, because the autouse fixture happens to
+        # leave the counter at 0 -- its control input comes from the fixture rather
+        # than from the thing under test. With an absolute count, any earlier
+        # observation in the process makes an empty update run look productive and
+        # blank the file, which is the loss the refusal exists to prevent.
+        queryguard._OBSERVATIONS = 7
+        with baseline_file({"tests.m.C.test_a": {SELECT_AUTHOR: 2}}) as path, updating():
+            with pytest.raises(SystemExit):
+                run_through_runner(QueryGuardRunner(), guarded_suite())
+            assert json.loads(path.read_text()) == {"tests.m.C.test_a": {SELECT_AUTHOR: 2}}
+
+    def test_a_bad_baseline_directory_is_refused_before_the_suite_runs(self):
+        # Otherwise it surfaces as a bare FileNotFoundError from `run_suite`'s
+        # `finally`, after every test has already executed.
+        ran = []
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "nope" / "baseline.json"
+            with override_settings(QUERY_GUARD_BASELINE=str(missing)), updating():
+                with unittest.mock.patch.object(unittest.TextTestRunner, "run", lambda self, suite: ran.append(1)):
+                    with pytest.raises(ImproperlyConfigured) as caught:
+                        QueryGuardRunner().run_suite(guarded_suite())
+        assert "not a directory" in str(caught.value)
+        assert ran == []
 
     def test_a_run_that_observed_nothing_may_create_a_file_that_is_not_there(self):
         # Nothing is at risk: there is no recorded state to lose, and refusing here
@@ -2470,15 +2570,25 @@ class StaleBaselineGateTests(TestCase):
 
     def test_the_message_does_not_claim_a_pass_when_there_were_failures(self):
         # Printed directly under `FAILED`, where "the tests passed" is a plain lie.
-        runner, result, _, _ = self._stale_run()
-        result.failures.append((None, "a real failure"))
-        stderr = io.StringIO()
-        with unittest.mock.patch("sys.stderr", stderr):
-            counted = runner.suite_result(unittest.TestSuite(), result)
-        printed = stderr.getvalue()
-        assert "The tests themselves passed" not in printed
-        assert "Separately from the failures above" in printed
-        assert counted == 2
+        # All three arms of the aggregate, because a test exercising only `failures`
+        # cannot tell `not (failures or errors or unexpectedSuccesses)` apart from
+        # `not failures` -- and an errored run is the commonest of the three.
+        for arm in ("failures", "errors", "unexpectedSuccesses"):
+            with self.subTest(arm=arm):
+                queryguard._FINDINGS.clear()
+                queryguard._OBSERVED.clear()
+                runner, result, _, _ = self._stale_run()
+                if arm == "unexpectedSuccesses":
+                    result.unexpectedSuccesses.append(None)
+                else:
+                    getattr(result, arm).append((None, "a real problem"))
+                stderr = io.StringIO()
+                with unittest.mock.patch("sys.stderr", stderr):
+                    counted = runner.suite_result(unittest.TestSuite(), result)
+                printed = stderr.getvalue()
+                assert "The tests themselves passed" not in printed, arm
+                assert "Separately from the failures above" in printed, arm
+                assert counted >= 1, arm
 
     @override_settings(QUERY_GUARD_REPORT_ONLY=True)
     def test_report_only_mode_reports_but_does_not_fail(self):
@@ -2576,6 +2686,54 @@ class StaleBaselineGateTests(TestCase):
             runner.suite_result(suite, result)
         assert "pinned.json" in stderr.getvalue()
 
+    def test_the_stale_gate_is_live_on_an_explicitly_serial_run(self):
+        # `--parallel=1` is the spelling this module's own refusals tell you to use,
+        # and `> 1` versus `>= 1` is one character. The sibling guard on the update
+        # path has a `parallel = 1` control, which is exactly why this one read as
+        # covered and was not: a control on one flag says nothing about the one
+        # beside it, and every other test here leaves `parallel` at its default 0.
+        seed_books()
+        runner = QueryGuardRunner()
+        runner.parallel = 1
+        suite = guarded_suite(clean_case("tests.m.C.test_b"))
+        with baseline_file({"tests.m.C.test_b": {SELECT_AUTHOR: 4}}):
+            result, printed = run_through_runner(runner, suite)
+        assert "INERT under --parallel" not in printed
+        assert runner.stale_baseline_entries == ["tests.m.C.test_b"]
+        assert runner.suite_result(suite, result) == 1
+
+    def test_the_stale_gate_is_live_at_the_default_parallel_value(self):
+        # The other degenerate value: Django leaves `parallel` at 0 on a serial
+        # runner, so `>= 0` would make the gate inert everywhere.
+        seed_books()
+        runner = QueryGuardRunner()
+        assert getattr(runner, "parallel", 0) == 0, runner.parallel
+        with baseline_file({"tests.m.C.test_b": {SELECT_AUTHOR: 4}}):
+            _, printed = run_through_runner(runner, guarded_suite(clean_case("tests.m.C.test_b")))
+        assert "INERT under --parallel" not in printed
+        assert runner.stale_baseline_entries == ["tests.m.C.test_b"]
+
+    def test_the_mode_is_read_off_the_run_not_off_the_setting_afterwards(self):
+        # `suite_result` runs after `run_suite` returns. Re-reading `report_only()`
+        # there lets it answer about a different mode than the one the verdict was
+        # computed under, so `settle_baseline` reports a note while `suite_result`
+        # fails the run, or the reverse.
+        runner, result, _, _ = self._stale_run()
+        assert runner.stale_baseline_report_only is False
+        with override_settings(QUERY_GUARD_REPORT_ONLY=True):
+            stderr = io.StringIO()
+            with unittest.mock.patch("sys.stderr", stderr):
+                assert runner.suite_result(unittest.TestSuite(), result) == 1
+
+    def test_a_run_settled_in_report_only_mode_does_not_gate_afterwards(self):
+        # The other direction, so the assertion above is about the captured value
+        # rather than about `suite_result` ignoring the mode altogether.
+        with override_settings(QUERY_GUARD_REPORT_ONLY=True):
+            runner, result, _, _ = self._stale_run()
+        assert runner.stale_baseline_report_only is True
+        assert runner.stale_baseline_entries == ["tests.m.C.test_b"]
+        assert runner.suite_result(unittest.TestSuite(), result) == 0
+
     def test_nothing_is_settled_when_no_baseline_is_configured(self):
         seed_books()
         runner = QueryGuardRunner()
@@ -2665,3 +2823,27 @@ class BaselineLifecycleTests(TestCase):
             # Same id, second invocation in the same process.
             run_through_runner(QueryGuardRunner(), guarded_suite(nplusone_case(planted)))
             assert json.loads(path.read_text()) == first
+
+
+class UpdateRunReportTests(SimpleTestCase):
+    """The report footer has to describe the run that produced it."""
+
+    def test_report_only_mode_says_nothing_failed_and_how_to_gate(self):
+        rendered = format_report([("a.B.test_c", {SELECT_AUTHOR: 3})])
+        assert "Report-only mode: nothing failed" in rendered
+        assert "QUERY_GUARD_REPORT_ONLY = False" in rendered
+
+    def test_an_update_run_says_it_recorded_them(self):
+        # An update run collects through the same list, and the report-only wording
+        # was then wrong three ways at once: it is not report-only, "fix these" is
+        # not what the run did, and it prescribes a setting already in force. These
+        # messages are the whole interface to a mechanism nobody can see working.
+        with updating():
+            rendered = format_report([("a.B.test_c", {SELECT_AUTHOR: 3})])
+        assert "Recorded in the baseline" in rendered
+        assert "Report-only mode" not in rendered
+        assert "QUERY_GUARD_REPORT_ONLY = False" not in rendered
+
+    def test_no_findings_is_a_clean_bill_whatever_the_mode(self):
+        with updating():
+            assert format_report([]) == "query guard: no repeated query shapes detected"

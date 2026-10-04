@@ -104,10 +104,16 @@ regenerate ships deletions nobody in it caused. In report-only mode that stays a
 note — someone mid-fix should not be blocked by a control tighter than the file
 records.
 
-Two refusals protect the file from an update run that looks like it worked: one
-under ``--parallel``, where findings live in worker processes nothing gathers back,
-and one for a run that bracketed no tests at all, which would blank an existing
-file. A blanked baseline is a *passing* suite until the next real regeneration.
+Writing the file, carrying entries and the stale gate all live on
+``QueryGuardRunner``, so **the baseline needs the runner** — none of it happens
+under ``QueryGuardMixin`` alone, and setting ``QUERY_GUARD_UPDATE_BASELINE`` with
+no runner active says so on stderr rather than quietly standing enforcement down.
+
+Four refusals protect the file from an update run that looks like it worked: no
+baseline configured; a baseline path whose directory does not exist; ``--parallel``,
+where findings live in worker processes nothing gathers back; and a run that
+bracketed no tests at all, which would blank an existing file. A blanked baseline
+is a *passing* suite until the next real regeneration.
 
 A partial update run — one module rather than the suite — carries the entries it
 did not exercise rather than deleting them, and says how many it carried. Deleting
@@ -228,6 +234,13 @@ from django.core.signals import request_finished, request_started
 from django.db import connections
 from django.test.runner import DiscoverRunner, ParallelTestSuite
 
+# The published surface, kept to what README.md documents plus the names the
+# baseline adds for a user. Deliberately NOT every helper the tests import: this
+# is an installed library, so each name here is a semver commitment, and the
+# baseline's internals (`write_baseline`, `merge_baseline`, `stale_entries`,
+# `unbaselined_shapes`, `carryable_baseline`, `observation_count`, …) are
+# implementation. `__all__` does not restrict `from … import <name>`, so the tests
+# reach them regardless and nothing is lost by not advertising them.
 __all__ = [
     "REGENERATE_COMMAND",
     "LegacyBaselineFormat",
@@ -237,25 +250,14 @@ __all__ = [
     "UnreadableBaselineEntry",
     "allow_repeats",
     "baseline_path",
-    "baselinable",
-    "carryable_baseline",
     "emit_report",
     "expect_repeats",
-    "expected_repeats_for",
-    "fail_expectation",
     "format_finding",
     "format_report",
     "guarding",
     "install",
     "is_select",
-    "load_baseline",
-    "merge_baseline",
     "new_window",
-    "observation_count",
-    "stale_entries",
-    "unbaselined_shapes",
-    "updating_baseline",
-    "write_baseline",
 ]
 
 #: Findings accumulated across the run while in report-only mode.
@@ -330,6 +332,9 @@ _ACTIVE_LOCK = threading.Lock()
 #: Reported at most once per process — see ``warm_content_types``.
 _WARM_FAILURE_REPORTED = False
 
+#: Reported at most once per process — see ``warn_update_without_runner``.
+_UPDATE_WITHOUT_RUNNER_REPORTED = False
+
 
 def _forbidden_query_error() -> type[BaseException] | tuple[()]:
     """Django's "no database queries in a SimpleTestCase" error.
@@ -383,6 +388,13 @@ def expect_repeats(count: int):
     Fix the N+1 and this test fails, naming the decorator to remove. So a known
     N+1 can be recorded at the call site, where a reader sees it, rather than in
     a generated file — and it cannot rot there.
+
+    **The pin is exact in both directions.** The count is the allowance as well as
+    the assertion, so a repeat that gets *deeper* fails too — as an ordinary
+    repeated-shape finding, with a message that names this decorator rather than
+    telling you to add ``@allow_repeats``. That is deliberate: the decorator is a
+    statement about how deep a known N+1 is, and a change in either direction is
+    worth a reader's attention.
 
     **It counts repeats, not shapes**, and that is a real limit rather than an
     oversight: the assertion is "some shape in this test still repeats ``count``
@@ -859,11 +871,26 @@ def format_report(findings: list[tuple[str, dict[str, int]]]) -> str:
         return "query guard: no repeated query shapes detected"
     rule = "=" * 78
     blocks = [format_finding(test_id, offenders) for test_id, offenders in findings]
+    # The footer has to describe the run that produced it. An update run collects
+    # through this same list, and the report-only wording was then wrong three ways
+    # at once: it is not report-only, it says "fix these" about findings the run
+    # just *recorded*, and it prescribes a setting already in force. These messages
+    # are the whole interface to a mechanism nobody can see working.
+    if updating_baseline():
+        footer = (
+            "Recorded in the baseline, not failed. Review the diff and commit the "
+            "file; each entry raises the allowance for the shape it names and no "
+            "further, so a new repeat of anything else still fails."
+        )
+    else:
+        footer = (
+            "Report-only mode: nothing failed. Fix these, or mark the deliberate ones "
+            "with @allow_repeats(n), then set QUERY_GUARD_REPORT_ONLY = False to make "
+            "this a gate."
+        )
     return (
         f"\n{rule}\nquery guard: {len(findings)} test(s) with repeated query shapes\n"
-        f"{rule}\n" + "\n".join(blocks) + f"\n{rule}\n"
-        "Report-only mode: nothing failed. Fix these, or mark the deliberate ones with "
-        "@allow_repeats(n), then set QUERY_GUARD_REPORT_ONLY = False to make this a gate."
+        f"{rule}\n" + "\n".join(blocks) + f"\n{rule}\n" + footer
     )
 
 
@@ -966,6 +993,35 @@ def warm_content_types(test) -> None:
                 f"window may report a false N+1.",
                 file=sys.stderr,
             )
+
+
+def warn_update_without_runner() -> None:
+    """Say, once, that ``QUERY_GUARD_UPDATE_BASELINE`` is set with no runner.
+
+    Only ``QueryGuardRunner`` writes the baseline. Under ``QueryGuardMixin`` the
+    variable can therefore neither regenerate anything nor be refused by
+    ``_require_writable_baseline``, and enforcement still steps aside for it — so
+    without this the run is green, the file is absent, and nothing says why. That
+    is the "green that reads as a checked green" the rest of this module spends
+    three refusals preventing.
+
+    A warning rather than a refusal, because the variable is a legitimate thing to
+    have exported while running a mixin-guarded module on purpose; what is not
+    legitimate is doing it silently.
+    """
+    global _UPDATE_WITHOUT_RUNNER_REPORTED
+    if _UPDATE_WITHOUT_RUNNER_REPORTED:
+        return
+    _UPDATE_WITHOUT_RUNNER_REPORTED = True
+    print(
+        "query guard: QUERY_GUARD_UPDATE_BASELINE is set but no QueryGuardRunner is "
+        "active, so nothing will be written and nothing is being enforced. Only the "
+        "runner regenerates the baseline — set "
+        'TEST_RUNNER = "abi_django_utils.queryguard.QueryGuardRunner" (or pass '
+        "--testrunner=...) for this run, or unset the variable.",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 @contextmanager
@@ -1078,6 +1134,15 @@ def check(test, collector: QueryCollector, *, completed: bool = True) -> None:
     # precisely the case where `offenders` is empty and every branch below
     # returns. Skipped on an incomplete run for the usual reason: the count is an
     # under-count, so "it stopped repeating" is not a thing this run can know.
+    # `_RUN_ACTIVE` above is load-bearing and not belt-and-braces. Only the runner
+    # writes the file, so under `QueryGuardMixin` — no `run_suite`, no
+    # `settle_baseline` — an update run would have collected instead of enforcing,
+    # written nothing, and said nothing: a green suite, no file, no diagnostic. The
+    # runner refuses this exact situation outright, and an env var left exported in
+    # a shell is precisely how it gets reached by accident.
+    if updating_baseline() and not _RUN_ACTIVE:
+        warn_update_without_runner()
+
     expected = expected_repeats_for(test)
     if expected is not None and completed:
         worst = collector.worst_count()
@@ -1098,7 +1163,7 @@ def check(test, collector: QueryCollector, *, completed: bool = True) -> None:
     # condition the regeneration command is itself red: this library's positive
     # controls plant an N+1 and assert the inner test fails, and collecting
     # instead of failing makes every one of them report a pass.
-    collecting = report_only() or (updating_baseline() and on_run_baseline and baselinable(test_id))
+    collecting = report_only() or (updating_baseline() and _RUN_ACTIVE and on_run_baseline and baselinable(test_id))
     if collecting:
         _FINDINGS.append((test_id, offenders))
         return
@@ -1117,19 +1182,40 @@ def check(test, collector: QueryCollector, *, completed: bool = True) -> None:
 
 
 def fail_with(test, test_id: str, allowances: dict[str, int], offenders: dict[str, int]) -> None:
-    """Fail ``test``, naming the allowance each shape broke and what to do."""
+    """Fail ``test``, naming the allowance each shape broke and what to do.
+
+    The advice is conditional on what the test already carries, because advice that
+    prescribes something already present is worse than none: it reads as the guard
+    not having noticed, and the reader goes looking for the bug in their own test.
+    """
+    expected = expected_repeats_for(test)
+    if expected is not None:
+        # Already pinned. `@expect_repeats(n)` sets the allowance *and* asserts the
+        # repeat is still n deep, so it pins the count from both sides — which means
+        # a repeat that got DEEPER arrives here, and telling that author to add
+        # `@allow_repeats` names a decorator they have already written one better
+        # than. The thing to change is the number.
+        advice = (
+            f"\n\nThis test is decorated @expect_repeats({expected}), which pins the "
+            "repeat at exactly that depth. It got deeper, so either the regression is "
+            "real — fix it — or the new depth is correct and the decorator's number "
+            "should follow it."
+        )
+    else:
+        advice = (
+            "\n\nIf the repetition is deliberate, decorate the test with "
+            "@allow_repeats(n), or @expect_repeats(n) to pin a known N+1 so it fails "
+            "when somebody fixes it. If it is a real N+1, fix it — select_related or "
+            "prefetch_related is usually the answer. If the repeats are separate "
+            "units of work, bracket each one with new_window()."
+        )
     path = baseline_path()
     # Only mentioned when there is one. Telling a project with no baseline not to
     # hand-edit a file it does not have is noise in the middle of the one message
     # that has to be actionable.
     baseline_note = f" Do not hand-edit {path.name}; regenerate it with {REGENERATE_COMMAND}." if path else ""
     test.fail(
-        "repeated query shape (likely N+1):\n"
-        + format_finding(test_id, offenders, allowances)
-        + "\n\nIf the repetition is deliberate, decorate the test with "
-        "@allow_repeats(n). If it is a real N+1, fix it — select_related or "
-        "prefetch_related is usually the answer. If the repeats are separate "
-        "units of work, bracket each one with new_window()." + baseline_note
+        "repeated query shape (likely N+1):\n" + format_finding(test_id, offenders, allowances) + advice + baseline_note
     )
 
 
@@ -1206,6 +1292,13 @@ class QueryGuardRunner(DiscoverRunner):
     #: become process-global state every runner instance sees.
     stale_baseline_entries: list[str] = []
 
+    #: Whether the run that produced those entries was report-only. Captured for
+    #: the same reason the path is: ``suite_result`` runs after ``run_suite`` has
+    #: returned, so a re-read can answer about a different mode than the one the
+    #: verdict was computed under — and ``settle_baseline`` and ``suite_result``
+    #: then disagree about whether a stale entry is a note or a gate.
+    stale_baseline_report_only: bool = True
+
     #: The file those entries were measured against, captured at the same moment.
     #: ``suite_result`` must not re-read ``baseline_path()``: it runs after
     #: ``run_suite`` has returned, so the setting can have changed — and when it
@@ -1243,7 +1336,7 @@ class QueryGuardRunner(DiscoverRunner):
         blocked by it.
         """
         failures = super().suite_result(suite, result, **kwargs)
-        if not self.stale_baseline_entries or report_only():
+        if not self.stale_baseline_entries or self.stale_baseline_report_only:
             return failures
         named = self.stale_baseline_path.name if self.stale_baseline_path else "the baseline"
         # Phrased against `result`, not asserted. unittest prints `OK` when the
@@ -1308,6 +1401,7 @@ class QueryGuardRunner(DiscoverRunner):
         """
         self.stale_baseline_entries = []
         self.stale_baseline_path = None
+        self.stale_baseline_report_only = report_only()
         path = baseline_path()
         if path is None:
             # No baseline configured: nothing to write and nothing that can be
@@ -1362,6 +1456,14 @@ class QueryGuardRunner(DiscoverRunner):
         # anyway blanks it, and a blanked baseline is a *passing* suite until the
         # next real regeneration — the quietest possible way for this mechanism to
         # stop working.
+        #
+        # `SystemExit`, where `_require_writable_baseline`'s sibling refusals raise
+        # `ImproperlyConfigured`, and the split is deliberate. Those are settings
+        # errors, raised before the suite, where a traceback naming the class is the
+        # Django-idiomatic thing and costs nothing. This one fires from
+        # `run_suite`'s `finally`, after the whole suite has reported, where a
+        # traceback would bury the output the reader is actually there for.
+        # `SystemExit(msg)` prints the message alone.
         if not observed and path.exists():
             raise SystemExit(
                 f"query guard: refusing to rewrite {path} from a run that observed "
@@ -1415,6 +1517,19 @@ class QueryGuardRunner(DiscoverRunner):
                 "QUERY_GUARD_BASELINE is not, so there is nowhere to write. Point "
                 "it at a path inside your repository — the file is meant to be "
                 "committed and read in a diff."
+            )
+        parent = baseline_path().parent
+        if not parent.is_dir():
+            # Here rather than at the `write_text` in `run_suite`'s `finally`, which
+            # is reached only after every test has run: a bare FileNotFoundError
+            # after a full suite is the cost the `--parallel` check was moved into
+            # `__init__` to avoid. Same verdict, minutes cheaper. Not an access
+            # check as well — a directory that exists but refuses a write is a
+            # permissions problem whose own error names the path.
+            raise ImproperlyConfigured(
+                f"query guard: QUERY_GUARD_BASELINE points into {parent}, which is "
+                "not a directory, so the baseline cannot be written. Point it at a "
+                "path inside your repository."
             )
         if getattr(self, "parallel", 0) > 1:
             raise ImproperlyConfigured(
