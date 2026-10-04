@@ -180,21 +180,88 @@ class ItemListTests(QueryGuardMixin, TestCase):
 |---------|---------|---------|
 | `QUERY_GUARD_REPORT_ONLY` | `True` | Collect findings and print a report at the end of the run instead of failing tests |
 | `QUERY_GUARD_MAX_REPEATS` | `1` | How many times one shape may appear in one window before it is a finding |
+| `QUERY_GUARD_BASELINE` | *(none)* | Path to the baseline file. Unset means no baseline: nothing is excused |
 
 **Report-only is the default on purpose.** Switching a blanket detector on over
 an existing suite finds real N+1s, and a library that turns your suite red on
-install gets uninstalled. Read the report, fix or annotate what it names, then
-set `QUERY_GUARD_REPORT_ONLY = False` to make it a gate.
+install gets uninstalled. Read the report, baseline what it names, then set
+`QUERY_GUARD_REPORT_ONLY = False` to make it a gate.
 
-For the genuinely deliberate repeats:
+#### The baseline — how you enforce on a suite you have not triaged
+
+A blanket detector on an existing suite leaves two bad options — stay in
+report-only, where nobody reads it, or clear every finding before anything is
+protected — and one good one. The **baseline** is a committed record of what each
+test *already* repeats, so the guard fails on anything new from the day it lands.
 
 ```python
-from abi_django_utils.queryguard import allow_repeats
+QUERY_GUARD_BASELINE = BASE_DIR / "queryguard_baseline.json"
+QUERY_GUARD_REPORT_ONLY = False
+```
 
-@allow_repeats(5)
+```bash
+QUERY_GUARD_UPDATE_BASELINE=1 manage.py test   # writes the file; commit it
+```
+
+```json
+{
+  "shop.tests.DashboardTests.test_lists_orders": {
+    "SELECT \"shop_customer\".\"id\", ... WHERE \"id\" = %s LIMIT 21": 4
+  }
+}
+```
+
+- **Per query shape, not per test.** An entry raises the allowance for the query
+  that earned it and nothing else; a shape it does not name is judged as strictly
+  as in a test with no entry at all. A per-*test* allowance is a hole, not a
+  ratchet — a brand-new 2x repeat of an unrelated query lands inside it silently.
+- **It only tightens.** A baselined test that gets worse still fails. Fix one and
+  regenerating drops the entry; there is no way to loosen it except by hand, and
+  hand-editing is the one abuse this design cannot prevent.
+- **Regenerating is not optional.** An enforcing run that proves an entry is no
+  longer earned **fails**, naming the entries. Otherwise a fix tightens the ratchet
+  without the file following, and the next PR to regenerate ships deletions nobody
+  in it caused. Report-only mode keeps that as a note.
+- **Readable in a diff**, which is the whole value of the file: sorted, indented,
+  and naming the SQL, so a review sees *which* query a fix removed.
+- **No default path**, deliberately. This module lives in your virtualenv, so a
+  path derived from its own location would write a generated artifact somewhere
+  unreviewable that the next `uv sync` deletes. Unset means no baseline, which is
+  byte-identical to the behaviour without this feature.
+- **Two refusals** stop an update run that looks like it worked: under `--parallel`,
+  where findings live in worker processes nothing gathers back, and from a run that
+  bracketed no tests, which would blank an existing file. A blanked baseline is a
+  *passing* suite until the next real regeneration.
+- **A partial run carries what it did not measure.** `manage.py test shop.tests`
+  keeps every other entry and says how many it carried. Deleting them reads in
+  review exactly like the ratchet tightening while disarming the whole rest of the
+  suite.
+
+#### Two decorators, and which one you want
+
+```python
+from abi_django_utils.queryguard import allow_repeats, expect_repeats
+
+@allow_repeats(5)           # the repetition is INTENDED
 def test_pagination_walks_every_page(self):
     ...
+
+@expect_repeats(4)          # a known N+1 you are not fixing today
+def test_the_dashboard_still_queries_per_row(self):
+    ...
 ```
+
+`@allow_repeats` is a permanent exemption. The day somebody fixes the N+1 it was
+covering, it stays, the ceiling stays raised, and a new repeat of any shape in that
+test is silently inside it.
+
+`@expect_repeats` is the same allowance **plus an assertion that it is still
+needed** — fix the N+1 and the test fails, naming the decorator to remove. It
+counts repeats rather than shapes, so it cannot tell "this N+1" from "an N+1 of the
+same depth"; for shape-level pinning use the baseline, which records the SQL. The
+two compose: a baselined test may also carry the decorator. Unlike a blanket
+finding, `@expect_repeats` fails in report-only mode too — it is an assertion you
+wrote by hand about one test, not a detector sweeping an untriaged suite.
 
 #### Units of work
 
