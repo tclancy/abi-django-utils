@@ -2,7 +2,9 @@
 
 Shared Django utilities for Tom Clancy's projects ("A Better Internet" pattern library).
 
-Eliminates settings drift across Django apps by providing canonical env helpers, opinionated defaults, and TLS proxy configuration.
+Eliminates settings drift across Django apps by providing canonical env helpers, opinionated
+defaults, and TLS proxy configuration — plus shared test machinery that would otherwise be
+copy-pasted per project.
 
 ## Installation
 
@@ -148,6 +150,145 @@ Two vault entries per app: `vault_<app>_oidc_client_secret` (plaintext, mapped i
 #### Swapping to `django-allauth` later
 
 If a specific project needs `django-allauth` (e.g. adding more social providers), the swap is ~10 minutes and reuses the same `User` rows — both libraries link the local user by email. Replace the 3 `abi_django_utils.oidc` settings lines with `django-allauth`'s `SOCIALACCOUNT_PROVIDERS` block, swap `urls.py` `/oidc/` include for `/accounts/`, and update the Authelia `redirect_uris` to `/accounts/oidc/authelia/login/callback/`. See [issue #8](https://github.com/tclancy/abi-django-utils/issues/8) discussion for the full recipe.
+
+### `queryguard` — Blanket N+1 query detection for test suites
+
+Catches N+1 queries across an **entire** test suite with no per-test
+annotation. Needs no extra, no third-party dependency, and no runner migration:
+it is built on `connection.execute_wrapper()`, public and stable since Django
+2.0, so it cannot break the way `nplusone` did on each ORM internals change.
+
+An N+1 is one query *shape* run repeatedly inside one unit of work. The guard
+fingerprints every `SELECT` before parameters are interpolated and flags any
+shape that repeats inside one window, so the report names the offending query
+rather than just counting queries.
+
+```python
+# settings.py — blanket, across everything
+TEST_RUNNER = "abi_django_utils.queryguard.QueryGuardRunner"
+```
+
+```python
+# or one class at a time, leaving the rest of the suite alone
+from abi_django_utils.queryguard import QueryGuardMixin
+
+class ItemListTests(QueryGuardMixin, TestCase):
+    ...
+```
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `QUERY_GUARD_REPORT_ONLY` | `True` | Collect findings and print a report at the end of the run instead of failing tests |
+| `QUERY_GUARD_MAX_REPEATS` | `1` | How many times one shape may appear in one window before it is a finding |
+
+**Report-only is the default on purpose.** Switching a blanket detector on over
+an existing suite finds real N+1s, and a library that turns your suite red on
+install gets uninstalled. Read the report, fix or annotate what it names, then
+set `QUERY_GUARD_REPORT_ONLY = False` to make it a gate.
+
+For the genuinely deliberate repeats:
+
+```python
+from abi_django_utils.queryguard import allow_repeats
+
+@allow_repeats(5)
+def test_pagination_walks_every_page(self):
+    ...
+```
+
+#### Units of work
+
+Counting is scoped to a **window**, because that is what an N+1 lives inside: a
+test making two HTTP requests repeats the first's queries by design, and
+charging that to the second would flag correct code. Requests are bracketed
+automatically, at both ends.
+
+Anything Django does not signal — a Celery task body, a management command, a
+service function called directly — is one window per test unless you say
+otherwise, which makes a loop over two of them look like an N+1 of every shape
+they share. Bracket those:
+
+```python
+from abi_django_utils.queryguard import new_window
+
+for tenant in tenants:
+    with new_window():
+        call_command("rebuild_index", tenant=tenant.id)
+```
+
+`new_window()` is a no-op when no guard is active, so a helper shared between a
+test and a management command can call it unconditionally. Don't import this
+module *from* production code, though — it pulls `django.test.runner` and
+registers an `atexit` hook at import.
+
+#### What is and is not covered
+
+`execute_wrapper` is registered on the connections *this process* holds, and
+Django's `connections` is thread-local. ORM work on another thread therefore uses
+a connection the guard never wrapped.
+
+**The dividing line is how the event loop is entered, not sync versus async.**
+`sync_to_async`'s default `thread_sensitive=True` means "run on the thread the
+outer *synchronous* caller is on" — and with no outer synchronous caller it falls
+through to a shared single-worker thread pool instead. Measured on
+asgiref 3.11 / Django 6.0:
+
+| entry point | thread-sensitive work runs on | covered |
+|---|---|---|
+| `async_to_sync(coro)()` | `MainThread` | yes |
+| Django `async def test_*` | `MainThread` | yes |
+| `asyncio.run(coro)` | pool worker | **no** |
+| `asyncio.run` + `ThreadSensitiveContext` | pool worker | **no** |
+
+**Covered:**
+
+- Sync tests and sync views.
+- `async` views through `AsyncClient`, and Django's async ORM (`async for`,
+  `aget`) inside them.
+- Django's own `async def test_*` methods — `SimpleTestCase` wraps them in
+  `async_to_sync` before calling them, which is what keeps them on the main thread.
+- Every configured database alias.
+- `--parallel` workers. A `spawn`-started worker inherits no monkeypatch, so the
+  runner installs the guard inside each one; if Django's private worker hook ever
+  moves, `--parallel` is **refused at construction** rather than silently running
+  unguarded.
+
+**Not covered — these pass silently:**
+
+- A bare `asyncio.run()` / `run_until_complete()` in a test body, and
+  `pytest-asyncio`.
+- `unittest.IsolatedAsyncioTestCase`. It overrides `_callTestMethod`, so the
+  blanket patch never applies and the guard is not merely blind but never entered.
+- `sync_to_async(..., thread_sensitive=False)` and a bare `threading.Thread`.
+- Plain pytest *function* tests under the mixin-less path — the patch targets
+  `unittest.TestCase._callTestMethod`, so only `TestCase` subclasses are hooked.
+
+There is no fix available from inside an `execute_wrapper`, so these are
+documented and pinned by tests in both directions rather than worked around.
+
+Note that **SQLite does not save you here**: Django rewrites a `":memory:"` test
+database to `file:memorydb_<alias>?mode=memory&cache=shared`, so another thread
+shares the same tables rather than finding an empty database.
+
+#### Two more things worth knowing before you adopt
+
+**`QueryGuardRunner` needs Django's test runner.** A project on pytest cannot set
+`TEST_RUNNER` and get blanket coverage; use `QueryGuardMixin`, which works under
+any runner that goes through `unittest.TestCase`.
+
+**Generate your first report serially.** Findings live in a module-global list,
+which is per *process*. `--parallel` workers are separate processes and nothing
+gathers their lists back, so report-only mode under `--parallel` prints a partial
+report per worker at pool teardown rather than one consolidated report. Enforcing
+mode is unaffected — failures travel home in the test result.
+
+#### Not yet extracted
+
+The prototype in `itemshop` also carries a **baseline ratchet** — a committed
+per-shape record of what each test already repeats, so the guard fails on
+anything *new* from the day it lands. That is the piece that makes enforcement
+practical on a large existing suite without triaging every finding first, and it
+is a separate slice.
 
 ## Env Var Conventions
 

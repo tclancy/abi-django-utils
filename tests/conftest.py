@@ -5,25 +5,40 @@ from django.conf import settings
 
 
 def pytest_configure():
-    """Minimal Django setup for the oidc backend tests.
+    """Minimal Django setup for the library's tests.
 
-    The backend needs Django's ORM + auth machinery imported. We use
+    The oidc backend needs Django's ORM + auth machinery imported. We use
     an in-memory SQLite DB and a trivial settings module so no fixtures
     or migrations file need to ship in the library repo.
+
+    ``tests.queryguard_app`` adds two models with one FK between them, which is
+    the smallest shape an N+1 needs. It ships no migrations; Django's
+    ``create_test_db`` runs ``migrate --run-syncdb``, which creates the tables.
+    ``ROOT_URLCONF`` points at the views the query guard's end-to-end tests
+    drive through the test client.
     """
     if settings.configured:
         return
 
     settings.configure(
         DEBUG=False,
-        DATABASES={"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"}},
+        ALLOWED_HOSTS=["testserver"],
+        # Two aliases, because the guard enters `execute_wrapper` for every one
+        # of them and with a single alias that loop body runs exactly once in the
+        # whole suite -- which 100% line coverage cannot distinguish from working.
+        DATABASES={
+            "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"},
+            "secondary": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"},
+        },
         INSTALLED_APPS=[
             "django.contrib.auth",
             "django.contrib.contenttypes",
             "mozilla_django_oidc",
+            "tests.queryguard_app",
         ],
         AUTH_USER_MODEL="auth.User",
         MIDDLEWARE=[],
+        ROOT_URLCONF="tests.queryguard_urls",
         DEFAULT_AUTO_FIELD="django.db.models.BigAutoField",
         USE_TZ=True,
         SECRET_KEY="test-only-not-a-secret",
