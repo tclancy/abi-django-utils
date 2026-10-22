@@ -17,6 +17,9 @@ uv add "abi-django-utils[sentry] @ git+https://github.com/tclancy/abi-django-uti
 
 # With Authelia OIDC support
 uv add "abi-django-utils[oidc] @ git+https://github.com/tclancy/abi-django-utils"
+
+# With django-axes login brute-force protection
+uv add "abi-django-utils[axes] @ git+https://github.com/tclancy/abi-django-utils"
 ```
 
 ## Usage
@@ -62,6 +65,65 @@ sentry.init(debug=DEBUG)
 - `CSRF_TRUSTED_ORIGINS` — derived from public hosts in `ALLOWED_HOSTS`
 - `SECURE_PROXY_SSL_HEADER` — for `X-Forwarded-Proto`
 - `SESSION_COOKIE_SECURE` / `CSRF_COOKIE_SECURE` — on in production
+
+### `brute_force` — django-axes login brute-force protection
+
+Requires the `[axes]` extra, which pulls `django-axes[ipware]`. **The `ipware` part is load-bearing, not a nicety** — see below.
+
+```python
+# settings.py
+from abi_django_utils import brute_force
+
+INSTALLED_APPS = brute_force.with_axes_app([
+    # ...
+    "django.contrib.staticfiles",
+])
+
+MIDDLEWARE = brute_force.with_axes_middleware([
+    # ...
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+])
+
+locals().update(brute_force.axes_defaults())
+```
+
+`brute_force.axes_defaults()` returns:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `AUTHENTICATION_BACKENDS` | axes standalone backend, then `ModelBackend` | Pass `backends=[...]` to keep your own; the axes one is always put first |
+| `AXES_FAILURE_LIMIT` | `5` | `failure_limit=` |
+| `AXES_COOLOFF_TIME` | `1` (hour) | `cooloff_hours=` |
+| `AXES_LOCKOUT_PARAMETERS` | `[["ip_address"]]` | |
+| `AXES_RESET_ON_SUCCESS` | `True` | |
+| `AXES_ONLY_ADMIN_SITE` | `True` | `only_admin_site=False` to also watch a non-admin login |
+| `AXES_IPWARE_META_PRECEDENCE_ORDER` | `CF-Connecting-IP`, `X-Forwarded-For`, `REMOTE_ADDR` | omitted when `proxy_aware=False` |
+
+Three helpers compose the list settings, all idempotent and none of which mutate their argument:
+
+- `with_axes_app(installed_apps)` — appends `"axes"`
+- `with_axes_middleware(middleware)` — puts `AxesMiddleware` **last**, moving it there if it is already somewhere else; it maps a lockout signal onto the response, so it has to wrap the view
+- `with_axes_backend(backends)` — puts `AxesStandaloneBackend` **first**, so it sees the attempt before anything authenticates it
+
+#### Why the `ipware` extra is not optional
+
+`django-axes` resolves the client IP through `django-ipware`, which it declares under its own `ipware` extra. Install bare `django-axes` and two things are true at once, neither of them visible from your settings file:
+
+- `AXES_IPWARE_META_PRECEDENCE_ORDER` is never read. `axes.helpers.get_client_ip_address` falls through to `request.META["REMOTE_ADDR"]`.
+- `django-axes`' own default for that setting is `("REMOTE_ADDR",)` anyway — it does **not** read a client-supplied `X-Forwarded-For` by default.
+
+Behind a Cloudflare tunnel `REMOTE_ADDR` is the tunnel gateway, the same address for every visitor. With `AXES_LOCKOUT_PARAMETERS` keyed on `ip_address` that is one shared bucket: five failed logins from anyone lock out everyone, yourself included, and the per-client rate limit you think you installed does not exist.
+
+So `axes_defaults()` raises `ImproperlyConfigured` rather than hand back a precedence order django-axes would ignore. `proxy_aware=False` drops the key and accepts the shared bucket, which is a thing you can choose but not a thing you can get by accident.
+
+`tests/test_brute_force.py` drives `axes.helpers.get_client_ip_address` on a request carrying all three headers and asserts both directions — with the pin it resolves the `CF-Connecting-IP`, without it the gateway.
+
+#### `AXES_ONLY_ADMIN_SITE` defaults to `True`
+
+The exposure this answers is admin-login enumeration, and `True` is the narrowest change for an app adopting axes from nothing: it cannot lock a legitimate user out of a surface it does not watch. Two cases want `False`:
+
+- an app with its own public login (`recordclub` serves one at `/auth/login/`)
+- an app **already** running axes without the flag, where `True` would narrow what is covered today rather than widen it (`indivisible` does not set it)
 
 ### `sentry` — Sentry error monitoring
 
@@ -391,6 +453,8 @@ This library addresses settings drift across SI, hey-dover, and recordclub:
 **Why a library instead of a template:** Templates drift immediately. A library is importable, testable, and version-pinnable. When the convention changes, bump the version and all apps get the update.
 
 **Why two-module split (defaults + tls_proxy):** The deployment substrate (Cloudflare Tunnel today) is swappable. If an app moves off the homelab, it keeps `defaults` and swaps `tls_proxy`.
+
+**`brute_force` is the same argument one layer down.** Two apps ran django-axes and disagreed on `AXES_IPWARE_META_PRECEDENCE_ORDER` — a setting whose wrong value is invisible, because the app still looks protected while the lockout keys on the tunnel gateway instead of the client. That is drift a shared default fixes and a template does not.
 
 ## Projects Using This Package
 
