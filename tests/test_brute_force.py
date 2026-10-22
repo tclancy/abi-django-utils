@@ -307,6 +307,41 @@ class TestAxesResolvesTheRealClient:
         with override_settings(AXES_IPWARE_META_PRECEDENCE_ORDER=("REMOTE_ADDR",)):
             assert get_client_ip_address(tunnelled_request) == PROXY_IP
 
+    def test_without_ipware_the_pin_is_not_read_at_all(self, tunnelled_request):
+        """The upstream fact the ImproperlyConfigured raise rests on.
+
+        Everything else here runs with ipware installed, which is the only
+        environment this suite can be in -- so the claim that the precedence
+        order is *ignored* without it had nothing behind it. django-axes
+        exposes the seam as ``use_ipware``, taken from its own
+        ``IPWARE_INSTALLED`` when not passed. If a release ever started
+        honouring the setting independently, the raise would become pure
+        friction and this is what would say so.
+        """
+        from axes.helpers import get_client_ip_address
+
+        with override_settings(AXES_IPWARE_META_PRECEDENCE_ORDER=brute_force.CLOUDFLARE_META_PRECEDENCE_ORDER):
+            assert get_client_ip_address(tunnelled_request, use_ipware=False) == PROXY_IP
+
+    def test_a_direct_request_can_choose_its_own_lockout_key(self):
+        """The pin's limit, pinned so it is not mistaken for a guarantee.
+
+        ``CF-Connecting-IP`` is unspoofable only on traffic that transits
+        Cloudflare. A request that reaches Django by another route sets it
+        itself and gets a fresh lockout key per attempt. This is a property of
+        the deployment, not a defect in the helper, and it is asserted here so
+        the README's claim about it stays true.
+        """
+        from axes.helpers import get_client_ip_address
+
+        direct = RequestFactory().post(
+            "/admin/login/",
+            REMOTE_ADDR="192.168.1.50",
+            HTTP_CF_CONNECTING_IP="1.2.3.4",
+        )
+        with override_settings(AXES_IPWARE_META_PRECEDENCE_ORDER=brute_force.CLOUDFLARE_META_PRECEDENCE_ORDER):
+            assert get_client_ip_address(direct) == "1.2.3.4"
+
     def test_axes_own_default_is_remote_addr_only(self):
         """Pinned here because the ticket that asked for this said otherwise.
 

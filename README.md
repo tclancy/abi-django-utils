@@ -87,6 +87,8 @@ MIDDLEWARE = brute_force.with_axes_middleware([
 locals().update(brute_force.axes_defaults())
 ```
 
+`axes` ships models, so run `manage.py migrate` when you add it. Deploy these settings without migrating and the first login attempt — failed *or* successful — raises on a missing `axes_accessattempt` table, which is a login outage rather than the protection you were installing.
+
 `brute_force.axes_defaults()` returns:
 
 | Setting | Default | Notes |
@@ -116,14 +118,33 @@ Behind a Cloudflare tunnel `REMOTE_ADDR` is the tunnel gateway, the same address
 
 So `axes_defaults()` raises `ImproperlyConfigured` rather than hand back a precedence order django-axes would ignore. `proxy_aware=False` drops the key and accepts the shared bucket, which is a thing you can choose but not a thing you can get by accident.
 
-`tests/test_brute_force.py` drives `axes.helpers.get_client_ip_address` on a request carrying all three headers and asserts both directions — with the pin it resolves the `CF-Connecting-IP`, without it the gateway.
+`tests/test_brute_force.py` drives `axes.helpers.get_client_ip_address` on a request carrying all three headers and asserts all three directions — with the pin it resolves the `CF-Connecting-IP`, without the pin the gateway, and with ipware absent the gateway again regardless of the pin.
+
+#### What the pin does not protect against
+
+**The precedence order assumes Cloudflare is the only route to the app.** `CF-Connecting-IP` is unspoofable because Cloudflare overwrites it — on traffic that goes through Cloudflare. A request that reaches Django another way sets the header itself and picks its own lockout key, a fresh one per attempt. Measured with the pin active:
+
+| request | axes resolves |
+|---|---|
+| through the tunnel, `CF-Connecting-IP: 198.51.100.7` | `198.51.100.7` |
+| direct, claiming `CF-Connecting-IP: 1.2.3.4` | `1.2.3.4` |
+| direct, claiming `X-Forwarded-For: 203.0.113.9` | `203.0.113.9` |
+| direct, no headers claimed | the real `REMOTE_ADDR` |
+
+That route is open today: every homelab Django compose template publishes its port as `"{{ service_ports.X }}:8000"` with no `127.0.0.1:` prefix, so Docker binds it on `0.0.0.0` and the app answers on the LAN. For an app that **already** runs axes unpinned, that is the one way adopting this helper is not strictly better — unpinned it keys on the attacker's real `REMOTE_ADDR` and does lock out.
+
+Two places to close it, neither of them this function:
+
+- **the deployment** — bind the published port to loopback, which removes the non-Cloudflare route for every app at once. Preferred, and tracked separately.
+- **the library** — `AXES_CLIENT_IP_CALLABLE`, honouring `CF-Connecting-IP` only when `REMOTE_ADDR` is a known tunnel address. That needs a per-deployment trusted-proxy list, so it is a design call rather than a patch; see abi-django-utils#16. (`AXES_IPWARE_PROXY_TRUSTED_IPS` does **not** do this — ipware applies it to the `X-Forwarded-For` chain, not to `CF-Connecting-IP`.)
 
 #### `AXES_ONLY_ADMIN_SITE` defaults to `True`
 
-The exposure this answers is admin-login enumeration, and `True` is the narrowest change for an app adopting axes from nothing: it cannot lock a legitimate user out of a surface it does not watch. Two cases want `False`:
+The exposure this answers is admin-login enumeration, and `True` is the narrowest change for an app adopting axes from nothing: it cannot lock a legitimate user out of a surface it does not watch.
 
-- an app with its own public login (`recordclub` serves one at `/auth/login/`)
-- an app **already** running axes without the flag, where `True` would narrow what is covered today rather than widen it (`indivisible` does not set it)
+**All three consumers take the default.** django-axes can only observe a login that passes through `django.contrib.auth.authenticate()`, and none of `indivisible`, `recordclub` or `canvasoptimizer` has a non-admin login that does — checked for `authenticate(` and for a login route on each repo's `main`. For them `False` would widen nothing and would give up the narrowing on `/admin/`. Pass `False` for an app that routes a non-admin login through `authenticate()`.
+
+The corollary matters more than the flag: **a login that bypasses `authenticate()` is invisible to django-axes at any setting.** `recordclub`'s magic-link POST at `/auth/login/` is exactly that — it looks a `Member` up by email, mails a token, and keeps its own `request.session["member_id"]`. Rate-limiting it needs a different control; `recordclub` already carries `django-ratelimit`.
 
 ### `sentry` — Sentry error monitoring
 

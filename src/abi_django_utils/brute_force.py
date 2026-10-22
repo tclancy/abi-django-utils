@@ -29,9 +29,20 @@ from django.core.exceptions import ImproperlyConfigured
 
 #: ``request.META`` keys django-ipware walks, in order, to find the client.
 #: Cloudflare sets and overwrites ``CF-Connecting-IP`` on every request through
-#: the tunnel, so it is the only one of the three a client cannot choose.
-#: ``X-Forwarded-For`` is kept as the fallback for a non-Cloudflare proxy and
-#: ``REMOTE_ADDR`` for a direct request.
+#: the tunnel, so for traffic that transits Cloudflare it is the only one of the
+#: three a client cannot choose. ``X-Forwarded-For`` is the fallback for another
+#: proxy and ``REMOTE_ADDR`` for a direct request.
+#:
+#: **This order assumes Cloudflare is the only route to the app.** A request
+#: that reaches Django without transiting the tunnel can set either header
+#: itself, and gets a lockout key of its choosing -- a fresh one per attempt.
+#: Measured against ``axes.helpers.get_client_ip_address`` with this order
+#: active: a direct request claiming ``CF-Connecting-IP: 1.2.3.4`` resolves to
+#: ``1.2.3.4``. Every homelab Django compose template publishes its port
+#: without a ``127.0.0.1:`` prefix, so that route is open on the LAN today;
+#: closing it belongs in the deployment, not here. Closing it *here* would mean
+#: ``AXES_CLIENT_IP_CALLABLE`` and a per-deployment list of trusted proxy
+#: addresses -- see abi-django-utils#16.
 CLOUDFLARE_META_PRECEDENCE_ORDER = (
     "HTTP_CF_CONNECTING_IP",
     "HTTP_X_FORWARDED_FOR",
@@ -50,13 +61,18 @@ def ipware_installed() -> bool:
     """Report whether django-ipware is importable.
 
     This answers the same question ``axes.helpers.IPWARE_INSTALLED`` answers --
-    it is computed there from ``import ipware.ip`` -- but by looking the module
-    up rather than importing it. The caller is a Django settings module:
-    ``ipware.ip`` imports ``django.http`` at module level, and pulling that in
-    while ``django.conf.settings`` is still being assembled is a worse failure
-    than the one being prevented. ``find_spec`` touches neither.
+    it is computed there from ``import ipware.ip`` -- by looking the module up
+    instead of importing it. The caller is a Django settings module and a
+    look-up has no import side effects at all, where ``import ipware.ip`` would
+    execute ``ipware/__init__.py`` and pull in ``django.http`` for a question
+    that does not need either. (That import does *work* mid-settings; it is
+    simply more than the probe needs.)
 
-    ``test_agrees_with_axes_own_probe`` is what keeps the two in step.
+    One state the two can disagree in: django-ipware 8 requires the separate
+    ``python-ipware`` distribution, so a half-installed ipware answers yes here
+    and no in axes, and :func:`axes_defaults` would then emit the dead setting
+    it exists to refuse. ``test_agrees_with_axes_own_probe`` catches that only
+    in an environment already in that state.
     """
     return importlib.util.find_spec("ipware") is not None
 
@@ -97,18 +113,20 @@ def axes_defaults(
     cooloff_hours: int = 1,
     backends: Sequence[str] = (DJANGO_MODEL_BACKEND,),
     proxy_aware: bool = True,
-) -> dict:
+) -> dict[str, object]:
     """Return django-axes settings for a public login page behind a TLS proxy.
 
     Values are ``heydover``'s, which has run them in production longest.
 
-    ``only_admin_site`` defaults to ``True`` because the exposure this answers
-    is an admin-login enumeration and ``True`` is the narrowest change for an
-    app adopting axes from nothing -- it cannot lock a legitimate user out of a
-    surface it does not watch. Pass ``False`` for an app with its own public
-    login (``recordclub`` serves one at ``/auth/login/``) or for one already
-    running axes without the flag, where ``True`` would *narrow* what is
-    covered today.
+    ``only_admin_site`` defaults to ``True``, and all three consumers named on
+    the ticket take that default: none of them routes a non-admin login through
+    ``django.contrib.auth.authenticate()``, which is the only kind of login
+    django-axes can observe, so ``False`` would widen nothing while giving up
+    the narrowing on ``/admin/``. Pass ``False`` for an app that does have such
+    a login. Note what this implies: a login that bypasses
+    ``authenticate()`` -- ``recordclub``'s magic-link POST at ``/auth/login/``
+    is one -- is invisible to django-axes at any setting, and needs a different
+    control.
 
     ``proxy_aware=False`` omits ``AXES_IPWARE_META_PRECEDENCE_ORDER`` entirely
     and accepts that the lockout keys on the proxy's address, shared by every
@@ -118,7 +136,7 @@ def axes_defaults(
         is not installed, in which case django-axes would ignore the precedence
         order and resolve every tunnelled request to the gateway.
     """
-    settings: dict = {
+    settings: dict[str, object] = {
         "AUTHENTICATION_BACKENDS": with_axes_backend(backends),
         "AXES_FAILURE_LIMIT": failure_limit,
         "AXES_COOLOFF_TIME": cooloff_hours,
