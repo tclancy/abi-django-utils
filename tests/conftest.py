@@ -40,6 +40,11 @@ def pytest_configure():
             # Registering it here is what makes the command's discoverability
             # a tested property rather than an assumption.
             "abi_django_utils",
+            # django-axes declares models at import time, so ``import
+            # axes.helpers`` raises unless the app is installed. The
+            # brute_force tests drive its real IP resolver rather than
+            # comparing a list of header names to itself.
+            "axes",
             "tests.queryguard_app",
         ],
         AUTH_USER_MODEL="auth.User",
