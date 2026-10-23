@@ -22,7 +22,7 @@ class Command(BaseCommand):
             "--password-file",
             type=Path,
             default=None,
-            help="Newline-delimited list, gzipped or plain. Defaults to Django's own 19,640-entry list.",
+            help="Newline-delimited list, gzipped or plain. Defaults to Django's own ~20,000-entry list.",
         )
         parser.add_argument(
             "--limit",
@@ -35,21 +35,55 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
-        candidates = password_audit.load_candidates(
-            options["password_file"],
-            limit=options["limit"] or None,
-        )
+        limit = options["limit"] or None
+        candidates = password_audit.load_candidates(options["password_file"], limit=limit)
         accounts = list(password_audit.admin_accounts())
 
-        self._report_plan(accounts, candidates)
-        weak = password_audit.weak_account_labels(accounts, candidates)
+        self._refuse_an_empty_audit(accounts, candidates, options["password_file"])
+        self._report_plan(accounts, candidates, limit)
+        weak = self._audit(accounts, candidates)
         self.stdout.write(password_audit.COVERAGE_CAVEAT)
 
         if weak:
             raise CommandError(self._failure_message(weak, len(candidates)))
         self.stdout.write(self.style.SUCCESS(f"No admin account matched the {len(candidates)} candidates tested."))
 
-    def _report_plan(self, accounts, candidates) -> None:
+    def _audit(self, accounts, candidates) -> list[str]:
+        """Run the audit, writing each finding as it arrives.
+
+        A full-list audit is tens of minutes per account, so a result that
+        only exists at the end is a result a dropped session throws away.
+        Labels carry no secret, so streaming them costs nothing.
+        """
+        weak = []
+        for label in password_audit.iter_weak_account_labels(accounts, candidates):
+            self.stderr.write(f"WEAK: {label}")
+            weak.append(label)
+        return weak
+
+    def _refuse_an_empty_audit(self, accounts, candidates, path) -> None:
+        """Fail rather than report a clean audit of nothing.
+
+        The exit code is this command's whole product -- it is built to run
+        from CI or cron. A typo'd ``--password-file``, a truncated download or
+        an empty mounted volume otherwise yields exit 0 and "No admin account
+        matched the 0 candidates tested", which is a green security audit that
+        tested nothing. Zero admin accounts is a warning rather than an error:
+        an app with no staff is legitimate, but it is also what a wrong
+        ``DJANGO_SETTINGS_MODULE`` or ``DATABASE_URL`` looks like.
+        """
+        if not candidates:
+            source = path or "Django's own list"
+            raise CommandError(f"No candidates loaded from {source}; refusing to report a clean audit.")
+        if not accounts:
+            self.stdout.write(
+                self.style.WARNING(
+                    "No account has is_staff or is_superuser set, so nothing was audited. "
+                    "If you expected admin accounts here, check DJANGO_SETTINGS_MODULE and the database."
+                )
+            )
+
+    def _report_plan(self, accounts, candidates, limit) -> None:
         """Say what is about to happen, with a measured runtime estimate.
 
         Written before the work rather than after, because at Django's default
@@ -58,9 +92,15 @@ class Command(BaseCommand):
         """
         self.stdout.write(f"Admin accounts (is_staff or is_superuser): {len(accounts)}")
         self.stdout.write(f"Candidates to test: {len(candidates)}")
-        if not accounts or not candidates:
+        if limit is not None and len(candidates) == limit:
+            self.stdout.write(
+                f"--limit stopped at {limit}, so anything past the {limit} most common was not tested. "
+                "Pass --limit 0 to audit the whole list."
+            )
+        calibration_hash = password_audit.first_usable_hash(accounts)
+        if calibration_hash is None:
             return
-        per_check = password_audit.seconds_per_check(accounts[0].password)
+        per_check = password_audit.seconds_per_check(calibration_hash)
         estimate = password_audit.estimate_seconds(
             accounts=len(accounts),
             candidates=len(candidates),

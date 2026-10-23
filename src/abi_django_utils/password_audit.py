@@ -25,12 +25,16 @@ disclose a password (issue #17):
   discipline.
 * :func:`weak_account_labels` yields identifiers only.
 
-Cost is the other thing a caller has to know. Django's default hasher is
-PBKDF2-SHA256 at 1.2M iterations: one :func:`check_password` call costs
-~190 ms on an M-series Mac, so the full 19,640-entry list is ~63 minutes *per
-account*. :data:`DEFAULT_CANDIDATE_LIMIT` therefore stops at the most common
-1,000 (~3 min/account) and the command reports the limit it used, because a
-clean run's meaning depends entirely on how far it looked.
+Cost is the other thing a caller has to know, and it is version-dependent.
+Measured on Django 6.0.4 (PBKDF2-SHA256, 1.2M iterations) one
+:func:`check_password` call costs ~190 ms on an M-series Mac, so its
+19,640-entry list is ~63 minutes *per account*. Django 4.2 ships 20,000
+entries at 600k iterations, so roughly half that. Nothing here assumes either
+figure: :func:`seconds_per_check` measures the real cost at runtime against
+the account's own hash, and the command prints the estimate before it goes
+quiet. :data:`DEFAULT_CANDIDATE_LIMIT` stops at the most common 1,000 and the
+command says so, because a clean run's meaning depends entirely on how far it
+looked.
 """
 
 from __future__ import annotations
@@ -71,12 +75,14 @@ def default_password_list_path() -> Path:
     ``__file__``, so the audit and the preventive validator are provably
     pointed at one file.
 
-    Accessed through an *instance*: Django 6 made the attribute a
-    ``cached_property``, which off the class is the descriptor rather than a
-    path, while Django 4.2 has it as a plain class attribute. Instance access
-    is the one spelling that yields a path on both. It costs one read of the
-    80 KB list, which also proves the file is readable before we promise a
-    caller an audit.
+    Accessed through an *instance*, and that is load-bearing. The attribute is
+    a ``cached_property`` on every Django this library supports -- verified on
+    4.2.30, 5.0.14, 5.2.18 and 6.0.4 -- so class access yields the descriptor
+    object rather than a path and ``Path()`` raises ``TypeError``. There is no
+    version here on which the shorter spelling works.
+
+    It costs one read of the 80 KB list, which also proves the file is
+    readable before we promise a caller an audit.
     """
     return Path(CommonPasswordValidator().DEFAULT_PASSWORD_LIST_PATH)
 
@@ -88,13 +94,38 @@ def read_password_list(path: Path, *, limit: int | None = DEFAULT_CANDIDATE_LIMI
     point of a limit: Django's list runs in descending frequency order
     (``123456`` first), so the first N are the N most common rather than an
     arbitrary slice. ``limit=None`` yields the whole file.
+
+    Compression is detected by trying to decompress, the way
+    ``CommonPasswordValidator`` does it, rather than by looking at the
+    filename. A ``.gz`` suffix is a convention and ``--password-file
+    list.txt.gzip`` is not unusual; opened as text with errors suppressed, a
+    gzip stream decodes into junk and the audit reports a confident clean run
+    against a list of garbage. Decode errors are likewise left to raise: "this
+    file is not a password list" must not round down to "here are some
+    candidates".
     """
     path = Path(path)  # a caller (or call_command kwargs) may hand us a str
-    opener = gzip.open if path.suffix == ".gz" else open
-    with opener(path, "rt", encoding="utf-8", errors="ignore") as handle:
+    with _open_text(path) as handle:
         stripped = (line.strip() for line in handle)
         non_empty = (candidate for candidate in stripped if candidate)
         yield from islice(non_empty, limit)
+
+
+def _open_text(path: Path):
+    """Open ``path`` as UTF-8 text, decompressing it if it is gzipped.
+
+    ``OSError`` rather than ``BadGzipFile`` so this mirrors
+    ``CommonPasswordValidator.__init__``: a missing path fails the fallback
+    too and raises its own ``FileNotFoundError`` from there.
+    """
+    handle = gzip.open(path, "rt", encoding="utf-8")
+    try:
+        handle.read(1)
+    except OSError:
+        handle.close()
+        return open(path, encoding="utf-8")
+    handle.seek(0)
+    return handle
 
 
 def load_candidates(path: Path | None = None, *, limit: int | None = DEFAULT_CANDIDATE_LIMIT) -> list[str]:
@@ -117,19 +148,43 @@ def password_is_common(encoded: str, candidates: Iterable[str]) -> bool:
     return any(check_password(candidate, encoded) for candidate in candidates)
 
 
-def weak_account_labels(users: Iterable, candidates: Iterable[str]) -> list[str]:
-    """Return identifiers of accounts whose password is in ``candidates``.
+def iter_weak_account_labels(users: Iterable, candidates: Iterable[str]) -> Iterator[str]:
+    """Yield identifiers of accounts whose password is in ``candidates``.
 
     Identifiers only, never the matched password. Accounts with an unusable
     password (``!``-prefixed, i.e. login disabled) cannot match anything, so
     they are skipped rather than charged a thousand hashes to prove it.
+
+    A generator because a full-list audit runs for tens of minutes per
+    account: the command writes each finding as it arrives, so an operator who
+    loses the session still has the findings that had been reached.
+
+    ``candidates`` is materialised first -- a generator argument would be
+    drained by the first account and every later one would be tested against
+    nothing and read clean.
     """
     candidates = list(candidates)
-    return [
-        account_label(user)
-        for user in users
-        if is_password_usable(user.password) and password_is_common(user.password, candidates)
-    ]
+    for user in users:
+        if is_password_usable(user.password) and password_is_common(user.password, candidates):
+            yield account_label(user)
+
+
+def weak_account_labels(users: Iterable, candidates: Iterable[str]) -> list[str]:
+    """Collect :func:`iter_weak_account_labels` for callers that want a list."""
+    return list(iter_weak_account_labels(users, candidates))
+
+
+def first_usable_hash(users: Iterable) -> str | None:
+    """Return a hash worth calibrating against, or ``None`` if there is none.
+
+    Calibrating on an unusable or unidentifiable hash measures Django's
+    fake-runtime path -- the *default* hasher's cost rather than that
+    account's -- which skews an estimate the operator is being asked to trust.
+    """
+    for user in users:
+        if is_password_usable(user.password):
+            return user.password
+    return None
 
 
 def seconds_per_check(encoded: str) -> float:

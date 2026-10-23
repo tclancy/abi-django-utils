@@ -23,8 +23,11 @@ entries to pay for that honestly.
 
 from __future__ import annotations
 
+import contextlib
 import gzip
 import io
+import logging
+import sys
 import tempfile
 from pathlib import Path
 from unittest import mock
@@ -48,6 +51,31 @@ SHARED_VALIDATORS = defaults.django_defaults()["AUTH_PASSWORD_VALIDATORS"]
 
 MD5_HASHER = "django.contrib.auth.hashers.MD5PasswordHasher"
 PBKDF2_HASHER = "django.contrib.auth.hashers.PBKDF2PasswordHasher"
+
+
+class _RecordingHandler(logging.Handler):
+    """Keeps every record so the leak test can grep what was logged."""
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+@contextlib.contextmanager
+def _root_logger_capture(handler: logging.Handler):
+    """Attach ``handler`` to the root logger at DEBUG for the duration."""
+    root = logging.getLogger()
+    previous_level = root.level
+    root.addHandler(handler)
+    root.setLevel(logging.DEBUG)
+    try:
+        yield handler
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(previous_level)
 
 
 def tmpdir() -> tempfile.TemporaryDirectory:
@@ -141,6 +169,38 @@ class PasswordListTests(SimpleTestCase):
         path = tmp_path / "candidates.txt"
         path.write_text("alpha\n\n  beta  \n\n", encoding="utf-8")
         assert password_audit.load_candidates(path) == ["alpha", "beta"]
+
+    def test_decompresses_a_gzip_whatever_it_is_named(self):
+        """Compression is detected by trying, not by the filename.
+
+        ``--password-file list.txt.gzip`` is not unusual. Opened as text with
+        errors suppressed, a gzip stream decodes into junk candidates and the
+        audit reports a confident clean run against garbage.
+        """
+        tmp_path = Path(self.enterContext(tmpdir()))
+        misnamed = tmp_path / "candidates.txt.gzip"
+        with gzip.open(misnamed, "wt", encoding="utf-8") as handle:
+            handle.write("alpha\nbeta\n")
+        assert password_audit.load_candidates(misnamed) == ["alpha", "beta"]
+
+    def test_a_plain_file_named_gz_is_still_read(self):
+        """Reachability control for the test above, in the other direction."""
+        tmp_path = Path(self.enterContext(tmpdir()))
+        misnamed = tmp_path / "candidates.gz"
+        misnamed.write_text("alpha\nbeta\n", encoding="utf-8")
+        assert password_audit.load_candidates(misnamed) == ["alpha", "beta"]
+
+    def test_a_file_that_is_not_text_raises_rather_than_yielding_junk(self):
+        """ "Not a password list" must not round down to "some candidates"."""
+        tmp_path = Path(self.enterContext(tmpdir()))
+        binary = tmp_path / "candidates.txt"
+        binary.write_bytes(b"\xff\xfe\x00\x01not utf-8 at all \x80\x81")
+        with pytest.raises(UnicodeDecodeError):
+            password_audit.load_candidates(binary)
+
+    def test_a_missing_file_raises(self):
+        with pytest.raises(FileNotFoundError):
+            password_audit.load_candidates(Path("/nonexistent/candidates.txt"))
 
     def test_accepts_a_string_path(self):
         """``call_command`` hands options through without running ``type=``."""
@@ -260,6 +320,40 @@ class WeakAccountLabelTests(TestCase):
 
         assert checked.call_count == 1
 
+    def test_a_generator_of_candidates_is_not_drained_by_the_first_account(self):
+        """``candidates`` is materialised before the loop; this is what binds it.
+
+        Without the conversion the first account consumes the generator and
+        every later one is tested against nothing -- reading clean. One
+        account cannot show that, so this test needs two.
+        """
+        first = User.objects.create_superuser("root", "root@example.com", SENTINEL_WEAK_PASSWORD)
+        second = User.objects.create_user("editor", password=SENTINEL_WEAK_PASSWORD, is_staff=True)
+
+        labels = password_audit.weak_account_labels(
+            password_audit.admin_accounts().order_by("pk"),
+            (candidate for candidate in ["alpha", SENTINEL_WEAK_PASSWORD]),
+        )
+
+        assert labels == [f"{first.pk}:root", f"{second.pk}:editor"]
+
+    def test_first_usable_hash_skips_an_unusable_one(self):
+        """Calibrating on an unusable hash measures Django's fake-runtime path."""
+        locked = User.objects.create_superuser("locked", "locked@example.com", SENTINEL_WEAK_PASSWORD)
+        locked.set_unusable_password()
+        locked.save()
+        usable = User.objects.create_user("editor", password=SENTINEL_WEAK_PASSWORD, is_staff=True)
+
+        chosen = password_audit.first_usable_hash(password_audit.admin_accounts().order_by("pk"))
+
+        assert chosen == User.objects.get(pk=usable.pk).password
+
+    def test_first_usable_hash_is_none_when_every_account_is_locked(self):
+        locked = User.objects.create_superuser("locked", "locked@example.com", SENTINEL_WEAK_PASSWORD)
+        locked.set_unusable_password()
+        locked.save()
+        assert password_audit.first_usable_hash(password_audit.admin_accounts()) is None
+
     def test_label_carries_the_identifier_and_no_secret(self):
         user = User.objects.create_superuser("root", "root@example.com", SENTINEL_WEAK_PASSWORD)
         label = password_audit.account_label(user)
@@ -267,13 +361,30 @@ class WeakAccountLabelTests(TestCase):
         assert not mentions(label, SENTINEL_WEAK_PASSWORD)
 
 
+@override_settings(PASSWORD_HASHERS=[MD5_HASHER, PBKDF2_HASHER])
 class CommandTests(TestCase):
-    """``manage.py audit_admin_passwords``, driven by name."""
+    """``manage.py audit_admin_passwords``, driven by name.
+
+    MD5 preferred here on purpose. Everything this class asserts is output
+    plumbing, exit status and coverage reporting; ``check_password`` behaves
+    identically whichever hasher produced the stored hash, so paying 190 ms a
+    call buys nothing. ``WeakAccountLabelTests`` keeps the project's real
+    hasher, so the audit is still exercised against a production-shaped hash.
+    """
 
     def setUp(self):
         self.tmp_path = Path(self.enterContext(tmpdir()))
         self.stdout = io.StringIO()
         self.stderr = io.StringIO()
+        # Channels a future leak would plausibly use, which the injected
+        # streams above cannot see. `capsys`/`capfd` are unavailable inside a
+        # unittest.TestCase, so capture them directly.
+        self.process_stdout = io.StringIO()
+        self.process_stderr = io.StringIO()
+        self.enterContext(contextlib.redirect_stdout(self.process_stdout))
+        self.enterContext(contextlib.redirect_stderr(self.process_stderr))
+        self.log_records = _RecordingHandler()
+        self.enterContext(_root_logger_capture(self.log_records))
 
     def run_command(self, *candidates: str, **kwargs):
         path = write_list(self.tmp_path, *candidates)
@@ -286,8 +397,26 @@ class CommandTests(TestCase):
         )
 
     def captured(self, error: BaseException | None = None) -> str:
-        """Everything the operator could see, including the raised message."""
-        return "\n".join([self.stdout.getvalue(), self.stderr.getvalue(), str(error or "")])
+        """Everything the operator could see, from every channel we can reach.
+
+        ``call_command(stdout=..., stderr=...)`` redirects only
+        ``self.stdout``/``self.stderr``. A leak introduced later is far more
+        likely to arrive as a leftover ``print()`` or a ``logger.info`` for
+        progress -- neither of which touches those -- so the process streams
+        and the root logger are captured too. Narrowing this to the injected
+        streams let a ``print(f"matched: {candidate}")`` mutant survive the
+        whole suite.
+        """
+        return "\n".join(
+            [
+                self.stdout.getvalue(),
+                self.stderr.getvalue(),
+                self.process_stdout.getvalue(),
+                self.process_stderr.getvalue(),
+                "\n".join(record.getMessage() for record in self.log_records.records),
+                str(error or ""),
+            ]
+        )
 
     def test_is_discoverable_by_name(self):
         """Proves the command is reachable through INSTALLED_APPS discovery.
@@ -323,6 +452,109 @@ class CommandTests(TestCase):
         assert mentions(captured + SENTINEL_WEAK_PASSWORD, SENTINEL_WEAK_PASSWORD)
 
         assert not mentions(captured, SENTINEL_WEAK_PASSWORD)
+
+    def test_the_leak_capture_can_see_every_channel_it_claims(self):
+        """Control for the test above: each captured channel really is live.
+
+        ``captured()`` concatenates six sources. If any one of them were wired
+        to the wrong object, a leak down that channel would read as redacted
+        and the test above would pass while disclosing a password. So write a
+        marker down each channel and assert it comes back.
+        """
+        print(SENTINEL_WEAK_PASSWORD, end="")
+        print(SENTINEL_WEAK_PASSWORD, end="", file=sys.stderr)
+        logging.getLogger("abi_django_utils.test").warning(SENTINEL_WEAK_PASSWORD)
+        self.stdout.write(SENTINEL_WEAK_PASSWORD)
+        self.stderr.write(SENTINEL_WEAK_PASSWORD)
+
+        assert self.process_stdout.getvalue() == SENTINEL_WEAK_PASSWORD
+        assert self.process_stderr.getvalue() == SENTINEL_WEAK_PASSWORD
+        assert [record.getMessage() for record in self.log_records.records] == [SENTINEL_WEAK_PASSWORD]
+        assert mentions(self.captured(), SENTINEL_WEAK_PASSWORD)
+
+    def test_reports_every_weak_account_not_just_the_first(self):
+        """Each app plausibly has more than one staff account.
+
+        With a single weak account, ``weak[:1]`` and ``", ".join(weak)``
+        versus ``weak[0]`` are all indistinguishable.
+        """
+        first = User.objects.create_superuser("root", "root@example.com", SENTINEL_WEAK_PASSWORD)
+        second = User.objects.create_user("editor", password=SENTINEL_WEAK_PASSWORD, is_staff=True)
+        strong = User.objects.create_user("safe", password="tessellate-marmoset-quorum-8814", is_staff=True)
+
+        with pytest.raises(CommandError) as raised:
+            self.run_command(SENTINEL_WEAK_PASSWORD)
+        message = str(raised.value)
+
+        assert f"{first.pk}:root" in message
+        assert f"{second.pk}:editor" in message
+        assert f"{strong.pk}:safe" not in message
+        assert "2 admin account(s)" in message
+
+    def test_exits_non_zero_through_the_real_entry_point(self):
+        """``call_command`` raises; ``manage.py`` exits. The ticket says exits.
+
+        ``run_from_argv`` is the path a cron job or CI step actually takes,
+        and it is the only one that both converts ``CommandError`` into an
+        exit status and runs argparse's ``type=`` coercions. A
+        ``CommandError(..., returncode=0)`` survives every ``call_command``
+        test in this file.
+        """
+        User.objects.create_superuser("root", "root@example.com", SENTINEL_WEAK_PASSWORD)
+        path = write_list(self.tmp_path, SENTINEL_WEAK_PASSWORD)
+        command = load_command_class("abi_django_utils", "audit_admin_passwords")
+        command.stdout, command.stderr = self.stdout, self.stderr
+
+        with pytest.raises(SystemExit) as raised:
+            command.run_from_argv(["manage.py", "audit_admin_passwords", "--password-file", str(path), "--limit", "1"])
+
+        assert raised.value.code != 0
+
+    def test_empty_candidate_list_is_an_error_not_a_clean_audit(self):
+        """A green audit that tested nothing is worse than a red one."""
+        User.objects.create_superuser("root", "root@example.com", SENTINEL_WEAK_PASSWORD)
+        with pytest.raises(CommandError) as raised:
+            self.run_command()
+        assert "refusing to report a clean audit" in str(raised.value)
+
+    def test_whitespace_only_candidate_list_is_also_an_error(self):
+        """The blank-line filter must not turn a junk file into an empty pass."""
+        path = self.tmp_path / "candidates.txt"
+        path.write_text("\n   \n\n", encoding="utf-8")
+        User.objects.create_superuser("root", "root@example.com", SENTINEL_WEAK_PASSWORD)
+        with pytest.raises(CommandError):
+            call_command(
+                "audit_admin_passwords",
+                password_file=str(path),
+                stdout=self.stdout,
+                stderr=self.stderr,
+            )
+
+    def test_no_admin_accounts_warns_rather_than_passing_quietly(self):
+        """Legitimate for an app with no staff; also what a wrong DB looks like."""
+        self.run_command("alpha")
+        assert "nothing was audited" in self.stdout.getvalue()
+        assert "DJANGO_SETTINGS_MODULE" in self.stdout.getvalue()
+
+    def test_a_truncating_limit_says_what_it_did_not_test(self):
+        """A clean run under --limit is a claim about the top N, not the list."""
+        User.objects.create_superuser("root", "root@example.com", "tessellate-marmoset-quorum-8814")
+        self.run_command("alpha", "beta", "gamma", limit=2)
+        assert "--limit stopped at 2" in self.stdout.getvalue()
+        assert "Pass --limit 0" in self.stdout.getvalue()
+
+    def test_an_untruncated_limit_does_not_claim_a_gap(self):
+        """Reachability control for the test above: the notice is conditional."""
+        User.objects.create_superuser("root", "root@example.com", "tessellate-marmoset-quorum-8814")
+        self.run_command("alpha", "beta", limit=50)
+        assert "--limit stopped at" not in self.stdout.getvalue()
+
+    def test_each_finding_is_written_as_it_is_found(self):
+        """An hour-long run must not hold its results until the end."""
+        user = User.objects.create_superuser("root", "root@example.com", SENTINEL_WEAK_PASSWORD)
+        with pytest.raises(CommandError):
+            self.run_command(SENTINEL_WEAK_PASSWORD)
+        assert f"WEAK: {user.pk}:root" in self.stderr.getvalue()
 
     def test_strong_password_exits_clean(self):
         User.objects.create_superuser("root", "root@example.com", "correct-horse-battery-staple-7731")
