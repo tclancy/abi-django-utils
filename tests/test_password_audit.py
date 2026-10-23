@@ -26,12 +26,11 @@ from __future__ import annotations
 import gzip
 import io
 import tempfile
-import time
 from pathlib import Path
 from unittest import mock
 
 import pytest
-from django.contrib.auth.hashers import check_password, make_password
+from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
@@ -46,6 +45,9 @@ from abi_django_utils import defaults, password_audit
 SENTINEL_WEAK_PASSWORD = "zz-sentinel-weak-pw-9471"
 
 SHARED_VALIDATORS = defaults.django_defaults()["AUTH_PASSWORD_VALIDATORS"]
+
+MD5_HASHER = "django.contrib.auth.hashers.MD5PasswordHasher"
+PBKDF2_HASHER = "django.contrib.auth.hashers.PBKDF2PasswordHasher"
 
 
 def tmpdir() -> tempfile.TemporaryDirectory:
@@ -155,23 +157,30 @@ class EstimateTests(SimpleTestCase):
             570.0
         )
 
-    def test_seconds_per_check_measures_rather_than_assumes(self):
-        """A constant would satisfy every caller and be wrong on any other box.
+    def test_seconds_per_check_tracks_the_hash_it_is_given(self):
+        """A well-chosen constant passes any single-sample bound. A ratio does not.
 
-        Compared against a hash verification timed here, so the test asserts
-        the function reports what it did rather than a plausible number. Loose
-        bounds (4x either way) because both samples are single timings on a
-        shared machine.
+        An earlier version of this test compared the measurement against one
+        timed here and allowed 4x either way -- which ``return 0.19`` survives,
+        because 0.19 s *is* this machine's PBKDF2 cost. MD5 costs ~0.01 ms and
+        PBKDF2 at 1.2M iterations ~190 ms, so a function that measures reports
+        a four-figure ratio and a constant reports 1.
+
+        Both hashes are verified under one ``PASSWORD_HASHERS`` setting, which
+        also demonstrates the claim in ``seconds_per_check``'s docstring: cost
+        follows the parameters baked into the stored hash, not the project's
+        current preferred hasher.
         """
-        encoded = make_password("x")
-        started = time.perf_counter()
-        check_password("y", encoded)
-        directly_timed = time.perf_counter() - started
+        with override_settings(PASSWORD_HASHERS=[MD5_HASHER, PBKDF2_HASHER]):
+            cheap_hash = make_password("x")
+            expensive_hash = make_password("x", hasher="pbkdf2_sha256")
+            assert cheap_hash.startswith("md5$")
 
-        measured = password_audit.seconds_per_check(encoded)
+            cheap = password_audit.seconds_per_check(cheap_hash)
+            expensive = password_audit.seconds_per_check(expensive_hash)
 
-        assert measured > 0
-        assert directly_timed / 4 < measured < directly_timed * 4
+        assert cheap > 0
+        assert expensive > cheap * 100
 
 
 class AdminAccountSelectionTests(TestCase):
@@ -295,6 +304,10 @@ class CommandTests(TestCase):
         with pytest.raises(CommandError) as raised:
             self.run_command(SENTINEL_WEAK_PASSWORD)
         assert f"{user.pk}:root" in str(raised.value)
+        # The message states its own redaction policy. Nothing behavioural
+        # depends on that sentence, so without this it can be deleted green.
+        assert "never passwords" in str(raised.value)
+        assert "Reset them now" in str(raised.value)
 
     def test_output_never_contains_the_matched_password(self):
         """The assertion this ticket exists for -- with its two controls."""
@@ -333,10 +346,20 @@ class CommandTests(TestCase):
             self.run_command(SENTINEL_WEAK_PASSWORD)
         assert password_audit.COVERAGE_CAVEAT in self.stdout.getvalue()
 
-    def test_caveat_names_both_limits_it_claims(self):
-        """The caveat is the command's whole honesty budget; pin its content."""
-        assert "cannot prove one strong" in password_audit.COVERAGE_CAVEAT
-        assert "lowercased" in password_audit.COVERAGE_CAVEAT
+    def test_caveat_names_every_limit_it_claims(self):
+        """The caveat is the command's whole honesty budget, so pin each clause.
+
+        Three separate claims, three separate assertions. Pinning only two of
+        them let a mutant delete the third -- "a password absent from the list
+        tested here may still be guessable" -- with the suite still green.
+        """
+        for claim in (
+            "can prove an account's password weak",
+            "may still be guessable",
+            "cannot prove one strong",
+            "lowercased",
+        ):
+            assert claim in password_audit.COVERAGE_CAVEAT, claim
 
     def test_reports_how_many_candidates_were_tested(self):
         """A clean run's meaning depends on the coverage, so it is in the output."""
