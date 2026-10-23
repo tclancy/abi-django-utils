@@ -55,8 +55,75 @@ sentry.init(debug=DEBUG)
 - `LANGUAGE_CODE`, `TIME_ZONE`, `USE_I18N`, `USE_TZ`
 - `DEFAULT_AUTO_FIELD` (BigAutoField)
 - `STORAGES` (WhiteNoise in prod, default in dev)
-- `AUTH_PASSWORD_VALIDATORS` (all four standard validators)
+- `AUTH_PASSWORD_VALIDATORS` (all four standard validators, including
+  `CommonPasswordValidator` — see [`password_audit`](#password_audit--dictionary-audit-of-admin-account-passwords))
 - `LOGGING` (console handler, respects `DJANGO_LOG_LEVEL` env var)
+
+### `password_audit` — dictionary audit of admin-account passwords
+
+Answers "does any account that can reach `/admin/` have a guessable
+password?", repeatably, for every app that installs the library.
+
+Add the library to `INSTALLED_APPS` — Django finds management commands by
+walking installed apps, so importing the helpers is not enough:
+
+```python
+INSTALLED_APPS = [
+    ...,
+    "abi_django_utils",
+]
+```
+
+Then, for the **first** audit of an app, test the whole list:
+
+```bash
+python manage.py audit_admin_passwords --limit 0
+```
+
+That is the run that answers the question. It is also the slow one — see the
+cost note below — so for a repeat run or a CI cadence the default samples the
+most common 1,000 instead:
+
+```bash
+python manage.py audit_admin_passwords
+
+# or bring your own list, gzipped or plain (compression is detected by
+# content, so the filename does not have to end in .gz)
+python manage.py audit_admin_passwords --password-file /path/to/list.txt.gz
+```
+
+Exits non-zero and names the failing accounts as `pk:username` when any
+account's password is in the list. It never prints, logs or returns the
+password that matched: `password_is_common()` takes a *hash* and returns a
+`bool`, so there is no plaintext in scope for a caller to render by accident.
+It also refuses to exit 0 having loaded no candidates — a typo'd
+`--password-file` is a failure, not a clean bill of health.
+
+**Read a clean run carefully.** The command prints the caveat itself on every
+run, and it is not boilerplate:
+
+- A dictionary test can prove an account weak. It can never prove one strong.
+- Django's shipped list is **lowercased**, so `Password1` reads clean here —
+  even though `CommonPasswordValidator` lowercases the submitted password and
+  *would* refuse it. The preventive half below catches a strictly wider set
+  than the audit half.
+- Coverage is whatever `--limit` allowed, and the command says when it
+  truncated. The list is ordered most-common-first, so the default is the top
+  1,000 and not an arbitrary slice.
+
+**Cost.** One hash verification is the irreducible unit and it is deliberately
+expensive, so this scales with `candidates × accounts`. Measured on Django
+6.0.4 (PBKDF2-SHA256, 1.2M iterations) a check is ~190 ms on an M-series Mac,
+making its 19,640-entry list ~63 min **per admin account**; Django 4.2 ships
+20,000 entries at 600k iterations, so roughly half. Nothing here assumes
+either figure — the command measures the real cost against one of your own
+hashes and prints the estimate before it starts, and writes each finding as it
+is found rather than at the end.
+
+The preventive half is already in `defaults.django_defaults()` — its
+`AUTH_PASSWORD_VALIDATORS` includes `CommonPasswordValidator`. An app using the
+`locals().update(defaults.django_defaults(debug=DEBUG))` pattern above is
+covered; an app that writes its own `AUTH_PASSWORD_VALIDATORS` list may not be.
 
 ### `tls_proxy` — TLS reverse proxy settings
 
