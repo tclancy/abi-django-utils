@@ -52,8 +52,60 @@ sentry.init(debug=DEBUG)
 - `LANGUAGE_CODE`, `TIME_ZONE`, `USE_I18N`, `USE_TZ`
 - `DEFAULT_AUTO_FIELD` (BigAutoField)
 - `STORAGES` (WhiteNoise in prod, default in dev)
-- `AUTH_PASSWORD_VALIDATORS` (all four standard validators)
+- `AUTH_PASSWORD_VALIDATORS` (all four standard validators, including
+  `CommonPasswordValidator` — see [`password_audit`](#password_audit--dictionary-audit-of-admin-account-passwords))
 - `LOGGING` (console handler, respects `DJANGO_LOG_LEVEL` env var)
+
+### `password_audit` — dictionary audit of admin-account passwords
+
+Answers "does any account that can reach `/admin/` have a guessable
+password?", repeatably, for every app that installs the library.
+
+Add the library to `INSTALLED_APPS` — Django finds management commands by
+walking installed apps, so importing the helpers is not enough:
+
+```python
+INSTALLED_APPS = [
+    ...,
+    "abi_django_utils",
+]
+```
+
+Then:
+
+```bash
+# the 1,000 most common passwords (~3 min per admin account)
+python manage.py audit_admin_passwords
+
+# all 19,640 Django ships (~63 min per admin account)
+python manage.py audit_admin_passwords --limit 0
+
+# your own list, gzipped or plain
+python manage.py audit_admin_passwords --password-file /path/to/list.txt.gz
+```
+
+Exits non-zero and names the failing accounts as `pk:username` when any
+account's password is in the list. It never prints, logs or returns the
+password that matched: `password_is_common()` takes a *hash* and returns a
+`bool`, so there is no plaintext in scope for a caller to render by accident.
+
+**Read a clean run carefully.** The command prints the caveat itself on every
+run, and it is not boilerplate:
+
+- A dictionary test can prove an account weak. It can never prove one strong.
+- Django's shipped list is **lowercased**, so `Password1` reads clean here —
+  even though `CommonPasswordValidator` lowercases the submitted password and
+  *would* refuse it. The preventive half below catches a strictly wider set
+  than the audit half.
+- Coverage is whatever `--limit` allowed. The default stops at 1,000 because
+  Django's hasher costs ~190 ms a check and the full list is an hour per
+  account. The list is ordered most-common-first, so that is the top 1,000 and
+  not an arbitrary slice.
+
+The preventive half is already in `defaults.django_defaults()` — its
+`AUTH_PASSWORD_VALIDATORS` includes `CommonPasswordValidator`. An app that sets
+`AUTH_PASSWORD_VALIDATORS = _defaults["AUTH_PASSWORD_VALIDATORS"]` is covered;
+an app that writes its own list may not be.
 
 ### `tls_proxy` — TLS reverse proxy settings
 

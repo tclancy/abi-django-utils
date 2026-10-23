@@ -34,6 +34,12 @@ def pytest_configure():
             "django.contrib.auth",
             "django.contrib.contenttypes",
             "mozilla_django_oidc",
+            # Installed, not merely importable: Django discovers management
+            # commands by walking INSTALLED_APPS, so `audit_admin_passwords`
+            # is only reachable by name from an app that installs the library.
+            # Registering it here is what makes the command's discoverability
+            # a tested property rather than an assumption.
+            "abi_django_utils",
             "tests.queryguard_app",
         ],
         AUTH_USER_MODEL="auth.User",
