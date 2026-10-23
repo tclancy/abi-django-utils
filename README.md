@@ -17,6 +17,9 @@ uv add "abi-django-utils[sentry] @ git+https://github.com/tclancy/abi-django-uti
 
 # With Authelia OIDC support
 uv add "abi-django-utils[oidc] @ git+https://github.com/tclancy/abi-django-utils"
+
+# With django-axes login brute-force protection
+uv add "abi-django-utils[axes] @ git+https://github.com/tclancy/abi-django-utils"
 ```
 
 ## Usage
@@ -62,6 +65,86 @@ sentry.init(debug=DEBUG)
 - `CSRF_TRUSTED_ORIGINS` — derived from public hosts in `ALLOWED_HOSTS`
 - `SECURE_PROXY_SSL_HEADER` — for `X-Forwarded-Proto`
 - `SESSION_COOKIE_SECURE` / `CSRF_COOKIE_SECURE` — on in production
+
+### `brute_force` — django-axes login brute-force protection
+
+Requires the `[axes]` extra, which pulls `django-axes[ipware]`. **The `ipware` part is load-bearing, not a nicety** — see below.
+
+```python
+# settings.py
+from abi_django_utils import brute_force
+
+INSTALLED_APPS = brute_force.with_axes_app([
+    # ...
+    "django.contrib.staticfiles",
+])
+
+MIDDLEWARE = brute_force.with_axes_middleware([
+    # ...
+    "django.contrib.auth.middleware.AuthenticationMiddleware",
+])
+
+locals().update(brute_force.axes_defaults())
+```
+
+`axes` ships models, so run `manage.py migrate` when you add it. Deploy these settings without migrating and the first login attempt — failed *or* successful — raises on a missing `axes_accessattempt` table, which is a login outage rather than the protection you were installing.
+
+`brute_force.axes_defaults()` returns:
+
+| Setting | Default | Notes |
+|---|---|---|
+| `AUTHENTICATION_BACKENDS` | axes standalone backend, then `ModelBackend` | Pass `backends=[...]` to keep your own; the axes one is always put first |
+| `AXES_FAILURE_LIMIT` | `5` | `failure_limit=` |
+| `AXES_COOLOFF_TIME` | `1` (hour) | `cooloff_hours=` |
+| `AXES_LOCKOUT_PARAMETERS` | `[["ip_address"]]` | |
+| `AXES_RESET_ON_SUCCESS` | `True` | |
+| `AXES_ONLY_ADMIN_SITE` | `True` | `only_admin_site=False` to also watch a non-admin login |
+| `AXES_IPWARE_META_PRECEDENCE_ORDER` | `CF-Connecting-IP`, `X-Forwarded-For`, `REMOTE_ADDR` | omitted when `proxy_aware=False` |
+
+Three helpers compose the list settings, all idempotent and none of which mutate their argument:
+
+- `with_axes_app(installed_apps)` — appends `"axes"`
+- `with_axes_middleware(middleware)` — puts `AxesMiddleware` **last**, moving it there if it is already somewhere else; it maps a lockout signal onto the response, so it has to wrap the view
+- `with_axes_backend(backends)` — puts `AxesStandaloneBackend` **first**, so it sees the attempt before anything authenticates it
+
+#### Why the `ipware` extra is not optional
+
+`django-axes` resolves the client IP through `django-ipware`, which it declares under its own `ipware` extra. Install bare `django-axes` and two things are true at once, neither of them visible from your settings file:
+
+- `AXES_IPWARE_META_PRECEDENCE_ORDER` is never read. `axes.helpers.get_client_ip_address` falls through to `request.META["REMOTE_ADDR"]`.
+- `django-axes`' own default for that setting is `("REMOTE_ADDR",)` anyway — it does **not** read a client-supplied `X-Forwarded-For` by default.
+
+Behind a Cloudflare tunnel `REMOTE_ADDR` is the tunnel gateway, the same address for every visitor. With `AXES_LOCKOUT_PARAMETERS` keyed on `ip_address` that is one shared bucket: five failed logins from anyone lock out everyone, yourself included, and the per-client rate limit you think you installed does not exist.
+
+So `axes_defaults()` raises `ImproperlyConfigured` rather than hand back a precedence order django-axes would ignore. `proxy_aware=False` drops the key and accepts the shared bucket, which is a thing you can choose but not a thing you can get by accident.
+
+`tests/test_brute_force.py` drives `axes.helpers.get_client_ip_address` on a request carrying all three headers and asserts all three directions — with the pin it resolves the `CF-Connecting-IP`, without the pin the gateway, and with ipware absent the gateway again regardless of the pin.
+
+#### What the pin does not protect against
+
+**The precedence order assumes Cloudflare is the only route to the app.** `CF-Connecting-IP` is unspoofable because Cloudflare overwrites it — on traffic that goes through Cloudflare. A request that reaches Django another way sets the header itself and picks its own lockout key, a fresh one per attempt. Measured with the pin active:
+
+| request | axes resolves |
+|---|---|
+| through the tunnel, `CF-Connecting-IP: 198.51.100.7` | `198.51.100.7` |
+| direct, claiming `CF-Connecting-IP: 1.2.3.4` | `1.2.3.4` |
+| direct, claiming `X-Forwarded-For: 203.0.113.9` | `203.0.113.9` |
+| direct, no headers claimed | the real `REMOTE_ADDR` |
+
+That route is open today: every homelab Django compose template publishes its port as `"{{ service_ports.X }}:8000"` with no `127.0.0.1:` prefix, so Docker binds it on `0.0.0.0` and the app answers on the LAN. For an app that **already** runs axes unpinned, that is the one way adopting this helper is not strictly better — unpinned it keys on the attacker's real `REMOTE_ADDR` and does lock out.
+
+Two places to close it, neither of them this function:
+
+- **the deployment** — bind the published port to loopback, which removes the non-Cloudflare route for every app at once. Preferred, and tracked separately.
+- **the library** — `AXES_CLIENT_IP_CALLABLE`, honouring `CF-Connecting-IP` only when `REMOTE_ADDR` is a known tunnel address. That needs a per-deployment trusted-proxy list, so it is a design call rather than a patch; see abi-django-utils#16. (`AXES_IPWARE_PROXY_TRUSTED_IPS` does **not** do this — ipware applies it to the `X-Forwarded-For` chain, not to `CF-Connecting-IP`.)
+
+#### `AXES_ONLY_ADMIN_SITE` defaults to `True`
+
+The exposure this answers is admin-login enumeration, and `True` is the narrowest change for an app adopting axes from nothing: it cannot lock a legitimate user out of a surface it does not watch.
+
+**All three consumers take the default.** django-axes can only observe a login that passes through `django.contrib.auth.authenticate()`, and none of `indivisible`, `recordclub` or `canvasoptimizer` has a non-admin login that does — checked for `authenticate(` and for a login route on each repo's `main`. For them `False` would widen nothing and would give up the narrowing on `/admin/`. Pass `False` for an app that routes a non-admin login through `authenticate()`.
+
+The corollary matters more than the flag: **a login that bypasses `authenticate()` is invisible to django-axes at any setting.** `recordclub`'s magic-link POST at `/auth/login/` is exactly that — it looks a `Member` up by email, mails a token, and keeps its own `request.session["member_id"]`. Rate-limiting it needs a different control; `recordclub` already carries `django-ratelimit`.
 
 ### `sentry` — Sentry error monitoring
 
@@ -391,6 +474,8 @@ This library addresses settings drift across SI, hey-dover, and recordclub:
 **Why a library instead of a template:** Templates drift immediately. A library is importable, testable, and version-pinnable. When the convention changes, bump the version and all apps get the update.
 
 **Why two-module split (defaults + tls_proxy):** The deployment substrate (Cloudflare Tunnel today) is swappable. If an app moves off the homelab, it keeps `defaults` and swaps `tls_proxy`.
+
+**`brute_force` is the same argument one layer down.** Two apps ran django-axes and disagreed on `AXES_IPWARE_META_PRECEDENCE_ORDER` — a setting whose wrong value is invisible, because the app still looks protected while the lockout keys on the tunnel gateway instead of the client. That is drift a shared default fixes and a template does not.
 
 ## Projects Using This Package
 

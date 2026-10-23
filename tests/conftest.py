@@ -34,6 +34,11 @@ def pytest_configure():
             "django.contrib.auth",
             "django.contrib.contenttypes",
             "mozilla_django_oidc",
+            # django-axes declares models at import time, so ``import
+            # axes.helpers`` raises unless the app is installed. The
+            # brute_force tests drive its real IP resolver rather than
+            # comparing a list of header names to itself.
+            "axes",
             "tests.queryguard_app",
         ],
         AUTH_USER_MODEL="auth.User",
