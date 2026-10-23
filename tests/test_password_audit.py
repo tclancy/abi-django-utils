@@ -38,7 +38,7 @@ from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
 from django.core.management import call_command, load_command_class
-from django.core.management.base import CommandError
+from django.core.management.base import CommandError, OutputWrapper
 from django.test import SimpleTestCase, TestCase, override_settings
 
 from abi_django_utils import defaults, password_audit
@@ -503,7 +503,10 @@ class CommandTests(TestCase):
         User.objects.create_superuser("root", "root@example.com", SENTINEL_WEAK_PASSWORD)
         path = write_list(self.tmp_path, SENTINEL_WEAK_PASSWORD)
         command = load_command_class("abi_django_utils", "audit_admin_passwords")
-        command.stdout, command.stderr = self.stdout, self.stderr
+        # Wrapped as ``BaseCommand.__init__`` would: ``run_from_argv`` runs the
+        # system checks, and any warning they print (axes's, for one) calls
+        # ``stderr.write(msg, style_func)``, which a bare StringIO rejects.
+        command.stdout, command.stderr = OutputWrapper(self.stdout), OutputWrapper(self.stderr)
 
         with pytest.raises(SystemExit) as raised:
             command.run_from_argv(["manage.py", "audit_admin_passwords", "--password-file", str(path), "--limit", "1"])
