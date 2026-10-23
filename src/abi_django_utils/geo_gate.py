@@ -20,9 +20,10 @@ to the public hostname. Both zones:
 
 The same capture carried a control request issued *on the box* straight to
 ``http://localhost:8091/``, and that request arrived with **no ``Cf-*`` header of
-any kind**. That is the whole security model of this module in one observation:
-the header is present exactly when Cloudflare put it there, and absent on every
-path that did not come through Cloudflare.
+any kind**. That is one non-Cloudflare path, measured once — enough to show the
+headers are put there by Cloudflare rather than being some ambient property of
+the request, and not enough to claim anything stronger. In particular a caller
+on such a path can simply send ``CF-IPCountry: US`` itself and be believed.
 
 What this gate is, and is not
 -----------------------------
@@ -30,12 +31,12 @@ What this gate is, and is not
 It is a control on the **public** path. It is not a perimeter.
 
 The containers publish on ``0.0.0.0`` (tclancy/homelab#591), so a caller already
-on the LAN reaches the admin directly and arrives with no header at all — which
-under the default policy below is *allowed*. Such a caller could also simply
-send ``CF-IPCountry: US`` themselves and be believed. Neither is a flaw in this
-code; both are restatements of the fact that the header is only meaningful on
-requests that came through Cloudflare. Treat this as defence in depth behind the
-tunnel, and fix the LAN exposure where it lives, in the deployment.
+on the LAN reaches the admin directly. The polite version of that caller arrives
+with no header and is *allowed* under the default policy below; the impolite
+version supplies its own ``CF-IPCountry`` and is believed. Neither is a flaw in
+this code — both are restatements of the fact that the header is only meaningful
+on requests that came through Cloudflare. Treat this as defence in depth behind
+the tunnel, and fix the LAN exposure where it lives, in the deployment.
 
 The policy, and the one choice that carries all the risk
 --------------------------------------------------------
@@ -56,7 +57,10 @@ geolocate" value ``XX``:
 
 ``T1`` (Cloudflare's code for Tor) is deliberately **not** treated as unknown.
 It is a real answer, it is simply not ``US``, so it is refused by the ordinary
-rule and does not depend on ``ADMIN_GEO_GATE_REQUIRE_HEADER`` at all.
+rule and does not depend on ``ADMIN_GEO_GATE_REQUIRE_HEADER`` at all. So is any
+other value Cloudflare would never send: an unrecognised country is an answer
+that is not allowed, never an absence, because reading it as an absence would
+turn a junk header into a way of choosing fail-open.
 
 Refusals raise a bare ``Http404``
 ---------------------------------
@@ -64,31 +68,67 @@ Refusals raise a bare ``Http404``
 Not 403, and not an ``HttpResponseNotFound`` built here. A 403 confirms both
 that the path exists and that something is geo-gating it, which is free
 reconnaissance. And raising ``Http404`` rather than returning a response lets
-Django render *the application's own* 404 — so the refusal is indistinguishable
-from any other missing page rather than merely uninformative.
+Django render *the application's own* 404 — so the refusal's **body** is the
+body of any other missing page rather than merely uninformative.
 
-The ``Http404`` is raised with **no message** on purpose: under ``DEBUG`` Django
-renders the technical 404 page, which prints the exception's own text. A message
-explaining the refusal would leak there and nowhere else, which is the worst
-place for it to leak.
+The ``Http404`` is raised with **no message** on purpose, and this is the part
+that would otherwise leak. Django's ``technical_404_response`` renders
+``str(exception)`` as the page's ``reason`` whenever ``DEBUG`` is on, so a
+message explaining the refusal would appear on screen in development and
+nowhere else — the worst of both. The reason goes to the log instead.
+
+**A refusal is indistinguishable from any application-raised 404, which is not
+quite the same as "from a genuine 404".** Three measured differences, all
+documented rather than wished away, because each is pinned by a test:
+
+1. **``Content-Length``.** Raising from above ``CommonMiddleware`` means
+   ``CommonMiddleware.process_response`` never sees the refusal, so it carries
+   no ``Content-Length`` where a 404 that went through the whole stack does.
+   This is the better half of a trade: mounting the gate *below*
+   ``CommonMiddleware`` equalises the headers but lets ``APPEND_SLASH`` turn a
+   refused ``/admin`` into a ``301`` to ``/admin/`` — which confirms the admin
+   exists, i.e. exactly the reconnaissance the 404 was chosen to avoid. Mount
+   it high, as below.
+2. **``Resolver404`` vs ``Http404``.** A 404 template that renders
+   ``{{ exception }}`` prints ``Resolver404`` for a URL that does not resolve
+   and ``Http404`` for anything that raised — including this gate and including
+   any view of your own. So such a template lets a refused caller tell "under
+   the gated prefix" from "not a URL at all". It reveals that ``/admin/*`` is
+   special; it does not reveal geo-gating. Django's built-in fallback 404 page
+   renders neither.
+3. **``DEBUG``.** The technical 404 page lists the URL patterns a
+   resolver-raised ``Http404`` tried, and a middleware-raised one has none, so
+   the two differ in development regardless of the above.
+
+What holds in every case is the part that matters: nothing in the response says
+*country*, *geo* or *Cloudflare*.
 
 Wiring it up
 ------------
 
 ::
 
+    from abi_django_utils import geo_gate
+
     MIDDLEWARE = [
         "django.middleware.security.SecurityMiddleware",
         "abi_django_utils.geo_gate.AdminGeoGateMiddleware",
-        ...
+        "django.middleware.common.CommonMiddleware",
+        # ... session, auth, axes below
     ]
 
     # Reads the ADMIN_GEO_GATE_ENABLED env var for the kill switch.
-    globals().update(admin_geo_gate_defaults())
+    globals().update(geo_gate.admin_geo_gate_defaults())
 
-Place it early — above the session, auth and axes middleware — so a refused
-request never touches the auth stack. It is cheap enough to go first: one dict
-lookup and one string compare for every request that is not under a gated path.
+Place it early — above ``CommonMiddleware`` for the reason above, and above the
+session, auth and axes middleware so a refused request never touches the auth
+stack. It is cheap enough to go first: a couple of settings reads and a prefix
+compare for every request that is not under a gated path.
+
+This is a plain sync middleware (``async_capable`` is left at Django's default
+of ``False``). Under ASGI, Django will adapt it and push the rest of the chain
+through a threadpool hop; every app consuming this library is WSGI today, and a
+dual-mode ``__call__`` is not worth its test surface until one is not.
 
 Settings
 --------
@@ -99,12 +139,16 @@ Settings
     than a deploy or a lockout.
 
 ``ADMIN_GEO_GATE_COUNTRIES`` (default ``{"US"}``)
-    Allowed ISO 3166-1 alpha-2 codes. Compared upper-cased.
+    Allowed ISO 3166-1 alpha-2 codes. Compared upper-cased. A bare string is
+    accepted and means that one country.
 
 ``ADMIN_GEO_GATE_PATHS`` (default ``("/admin/",)``)
-    Path prefixes the gate applies to. Everything else — the entire public
-    site — is untouched. A prefix also matches its own slashless form, so
-    ``/admin/`` gates ``/admin`` too, and does not gate ``/administrator/``.
+    Path prefixes the gate applies to, matched against ``request.path_info`` —
+    so they are **URLconf-relative** and a script-prefix mount does not need
+    them rewritten. Everything else — the entire public site — is untouched. A
+    prefix also matches its own slashless form, so ``/admin/`` gates ``/admin``
+    too, and does not gate ``/administrator/``. A bare string is accepted and
+    means that one prefix.
 
 ``ADMIN_GEO_GATE_REQUIRE_HEADER`` (default ``False``)
     See above. This is the load-bearing setting.
@@ -113,7 +157,9 @@ Settings
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 
+from django.conf import settings
 from django.http import Http404
 
 from abi_django_utils import env
@@ -131,11 +177,43 @@ UNKNOWN_COUNTRY_CODES = frozenset({"", "XX"})
 DEFAULT_COUNTRIES = frozenset({"US"})
 DEFAULT_PATHS = ("/admin/",)
 
+#: The logged country is caller-supplied and unbounded. Truncate it, so a hostile
+#: caller cannot write kilobytes per request into the warning log.
+MAX_LOGGED_COUNTRY_CHARS = 16
+
+
+def as_prefix_tuple(value: str | Iterable[str]) -> tuple[str, ...]:
+    """Normalise a path-prefix setting to a tuple.
+
+    A bare ``str`` is the one input that must be special-cased rather than
+    merely accepted, because iterating it *succeeds* and succeeds disastrously:
+    ``ADMIN_GEO_GATE_PATHS = ("/admin/")`` is a missing comma away from
+    ``("/admin/",)``, iterates as the characters ``/``, ``a``, ``d``…, and the
+    first of those is a prefix of every path there is. The failure is a 404 on
+    the whole public site, visible only in the logs.
+    """
+    if isinstance(value, str):
+        return (value,)
+    return tuple(value)
+
+
+def as_country_set(value: str | Iterable[str]) -> frozenset[str]:
+    """Normalise an allowed-country setting to an upper-cased set.
+
+    Same missing-comma hazard as :func:`as_prefix_tuple`, failing the other way:
+    ``ADMIN_GEO_GATE_COUNTRIES = "US"`` iterates to ``{"U", "S"}``, which
+    contains no country code at all, so every request to a gated path is
+    refused and the admin is unreachable.
+    """
+    if isinstance(value, str):
+        value = (value,)
+    return frozenset(code.strip().upper() for code in value)
+
 
 def admin_geo_gate_defaults(
     *,
-    countries: frozenset[str] | set[str] | None = None,
-    paths: tuple[str, ...] | None = None,
+    countries: str | Iterable[str] | None = None,
+    paths: str | Iterable[str] | None = None,
     require_header: bool = False,
     env_var: str = "ADMIN_GEO_GATE_ENABLED",
 ) -> dict:
@@ -149,22 +227,40 @@ def admin_geo_gate_defaults(
     """
     return {
         "ADMIN_GEO_GATE_ENABLED": env.bool(env_var, default=True),
-        "ADMIN_GEO_GATE_COUNTRIES": frozenset(countries) if countries else DEFAULT_COUNTRIES,
-        "ADMIN_GEO_GATE_PATHS": tuple(paths) if paths else DEFAULT_PATHS,
+        "ADMIN_GEO_GATE_COUNTRIES": as_country_set(countries) if countries else DEFAULT_COUNTRIES,
+        "ADMIN_GEO_GATE_PATHS": as_prefix_tuple(paths) if paths else DEFAULT_PATHS,
         "ADMIN_GEO_GATE_REQUIRE_HEADER": require_header,
     }
 
 
-def path_is_gated(path: str, prefixes: tuple[str, ...]) -> bool:
+def gate_enabled() -> bool:
+    """Is the gate switched on? Read per request so a settings reload takes effect."""
+    return bool(getattr(settings, "ADMIN_GEO_GATE_ENABLED", True))
+
+
+def gated_prefixes() -> tuple[str, ...]:
+    """The URLconf-relative path prefixes the gate applies to."""
+    return as_prefix_tuple(getattr(settings, "ADMIN_GEO_GATE_PATHS", DEFAULT_PATHS))
+
+
+def allowed_countries() -> frozenset[str]:
+    """The upper-cased set of country codes allowed through a gated path."""
+    return as_country_set(getattr(settings, "ADMIN_GEO_GATE_COUNTRIES", DEFAULT_COUNTRIES))
+
+
+def header_required() -> bool:
+    """Refuse, rather than allow, when the country is unknown?"""
+    return bool(getattr(settings, "ADMIN_GEO_GATE_REQUIRE_HEADER", False))
+
+
+def path_is_gated(path: str, prefixes: str | Iterable[str]) -> bool:
     """Is ``path`` under one of ``prefixes``?
 
     A prefix matches its own slashless form as well, so ``/admin/`` gates both
-    ``/admin/login/`` and a bare ``/admin`` — the latter matters because
-    ``APPEND_SLASH`` would otherwise answer it with a redirect decided before the
-    gate ever saw a country. ``/administrator/`` is not matched: the comparison is
-    against the prefix, not against a bare ``/admin``.
+    ``/admin/login/`` and a bare ``/admin``. ``/administrator/`` is not matched:
+    the comparison is against the prefix, not against a bare ``/admin``.
     """
-    for prefix in prefixes:
+    for prefix in as_prefix_tuple(prefixes):
         if path.startswith(prefix) or path == prefix.rstrip("/"):
             return True
     return False
@@ -188,46 +284,49 @@ def country_of(request) -> str | None:
 class AdminGeoGateMiddleware:
     """Refuse gated paths from outside ``ADMIN_GEO_GATE_COUNTRIES``.
 
-    Reads its settings on every request rather than caching them at
-    ``__init__``, so ``override_settings`` works in tests and a settings reload
-    takes effect without a restart. The cost is four ``getattr`` calls on a
-    module that already did a dict lookup.
+    Matches on ``request.path_info`` rather than ``request.path``, so the
+    configured prefixes are the ones in the app's ``urls.py``. ``request.path``
+    is ``SCRIPT_NAME + path_info``, so under ``FORCE_SCRIPT_NAME`` or a WSGI
+    mount a prefix of ``/admin/`` would stop matching ``/<prefix>/admin/`` and
+    the gate would quietly stop gating — with no warning, because the refusal
+    check would never be reached.
     """
 
     def __init__(self, get_response):
         self.get_response = get_response
 
     def __call__(self, request):
-        from django.conf import settings
-
-        if not getattr(settings, "ADMIN_GEO_GATE_ENABLED", True):
+        if not gate_enabled():
             return self.get_response(request)
 
-        prefixes = getattr(settings, "ADMIN_GEO_GATE_PATHS", DEFAULT_PATHS)
-        if not path_is_gated(request.path, prefixes):
+        path = request.path_info
+        if not path_is_gated(path, gated_prefixes()):
             return self.get_response(request)
 
         country = country_of(request)
         if country is None:
-            require = getattr(settings, "ADMIN_GEO_GATE_REQUIRE_HEADER", False)
-            logger.warning(
-                "admin geo gate: no %s on a request to %s — %s. "
-                "If this came through Cloudflare, the zone's IP Geolocation setting is off.",
-                COUNTRY_META_KEY.removeprefix("HTTP_").replace("_", "-"),
-                request.path,
-                "refusing (ADMIN_GEO_GATE_REQUIRE_HEADER)" if require else "allowing (fail open)",
-            )
-            if require:
-                raise Http404
-            return self.get_response(request)
+            return self._unknown_country(request, path)
 
-        allowed = getattr(settings, "ADMIN_GEO_GATE_COUNTRIES", DEFAULT_COUNTRIES)
-        if country not in {c.upper() for c in allowed}:
+        if country not in allowed_countries():
             logger.warning(
                 "admin geo gate: refused %s from country %s",
-                request.path,
-                country,
+                path,
+                country[:MAX_LOGGED_COUNTRY_CHARS],
             )
             raise Http404
 
+        return self.get_response(request)
+
+    def _unknown_country(self, request, path):
+        """Cloudflare did not say where this came from. Warn, then apply the policy."""
+        require = header_required()
+        logger.warning(
+            "admin geo gate: no %s on a request to %s — %s. "
+            "If this came through Cloudflare, the zone's IP Geolocation setting is off.",
+            COUNTRY_META_KEY.removeprefix("HTTP_").replace("_", "-"),
+            path,
+            "refusing (ADMIN_GEO_GATE_REQUIRE_HEADER)" if require else "allowing (fail open)",
+        )
+        if require:
+            raise Http404
         return self.get_response(request)

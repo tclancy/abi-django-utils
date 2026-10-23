@@ -72,14 +72,21 @@ work.
 
 ```python
 # settings.py
+from abi_django_utils import geo_gate
+
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "abi_django_utils.geo_gate.AdminGeoGateMiddleware",
+    "django.middleware.common.CommonMiddleware",
     # ... session, auth, axes below, so a refused request never reaches them
 ]
 
 globals().update(geo_gate.admin_geo_gate_defaults())
 ```
+
+**Above `CommonMiddleware`, deliberately.** Below it, `APPEND_SLASH` turns a
+refused `/admin` into a `301` to `/admin/`, which confirms the admin exists —
+the reconnaissance the 404 was chosen to avoid.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -96,13 +103,16 @@ delivered `Cf-Ipcountry: US`. In the same capture, a control request issued on
 the box straight to `http://localhost:8091/` arrived with **no `Cf-*` header of
 any kind.**
 
-**That control is the security model, and the limit.** The header means
-something precisely because only Cloudflare sets it — and the containers publish
-on `0.0.0.0` ([homelab#591](https://github.com/tclancy/homelab/issues/591)), so a
-caller already on the LAN reaches the admin with no header at all and is
-*allowed* under the default policy. They could equally send `CF-IPCountry: US`
-themselves and be believed. This is defence in depth behind the tunnel, not a
-perimeter; the LAN exposure is a deployment fix, not a middleware one.
+**That control is the security model, and the limit.** One non-Cloudflare path
+measured once is enough to show the headers are put there by Cloudflare rather
+than being some ambient property of a request — and not enough to claim
+anything stronger. The containers publish on `0.0.0.0`
+([homelab#591](https://github.com/tclancy/homelab/issues/591)), so a caller
+already on the LAN reaches the admin directly: the polite version arrives with
+no header and is *allowed* under the default policy, and the impolite version
+sends `CF-IPCountry: US` itself and is believed. This is defence in depth behind
+the tunnel, not a perimeter; the LAN exposure is a deployment fix, not a
+middleware one.
 
 **Unknown country is the load-bearing choice.** Missing, empty, or Cloudflare's
 own could-not-geolocate `XX` all count as unknown. The default
@@ -120,10 +130,28 @@ regardless of `ADMIN_GEO_GATE_REQUIRE_HEADER`.
 
 **Refusals raise a bare `Http404`.** Not 403 — that confirms the path exists and
 that something is gating it. Raising rather than returning lets Django render
-the *application's own* 404, so a refusal is byte-identical to a genuine miss on
-the same path (asserted in the tests). The `Http404` carries no message, because
-under `DEBUG` Django prints the exception text on the technical 404 page — the
-one place an explanation would leak. The reason goes to the log instead.
+the *application's own* 404, so a refusal is byte-identical to any
+application-raised 404. The `Http404` carries no message, because Django's
+`page_not_found` surfaces `exception.args[0]` and `DEBUG`'s technical 404 page
+prints it — the one place an explanation would leak. The reason goes to the log
+instead.
+
+Three distinguishers remain, all pinned by tests rather than claimed away: the
+refusal carries no `Content-Length` (`CommonMiddleware` is below it); a 404
+template that renders `{{ exception }}` prints `Http404` where a non-resolving
+URL prints `Resolver404`, so it reveals that `/admin/*` is special; and under
+`DEBUG` the bodies differ anyway. None of the three says *country*, *geo* or
+*Cloudflare*, which is the property that matters.
+
+**Settings may be a bare string.** `ADMIN_GEO_GATE_PATHS = ("/admin/")` is a
+missing comma away from a 1-tuple and would otherwise iterate as the characters
+`/`, `a`, `d`… — gating the entire public site on the first one. Both this and
+`ADMIN_GEO_GATE_COUNTRIES = "US"` (which would otherwise allow nobody) are
+coerced, and both cases are tested.
+
+**Prefixes are URLconf-relative.** Matching is on `request.path_info`, not
+`request.path`, so a `FORCE_SCRIPT_NAME` or WSGI-mounted app does not need its
+prefixes rewritten — and more to the point, does not silently stop being gated.
 
 **It composes with a Cloudflare WAF rule rather than replacing one.** A Custom
 Rule (`http.request.uri.path contains "/admin" and ip.geoip.country ne "US"`,
