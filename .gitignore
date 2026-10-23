@@ -228,3 +228,6 @@ tags
 
 # End of https://www.toptal.com/developers/gitignore/api/python,macos,vim
 .envrc
+
+# Dispatch agent scratch space (mutation harnesses, probe scripts) — never shipped.
+.scratch/
