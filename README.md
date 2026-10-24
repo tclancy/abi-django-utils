@@ -154,6 +154,16 @@ MIDDLEWARE = brute_force.with_axes_middleware([
 locals().update(brute_force.axes_defaults())
 ```
 
+**Use `locals().update(...)` as shown, not a key-by-key copy.** An app that
+assigns each setting individually — `AXES_FAILURE_LIMIT = _axes["AXES_FAILURE_LIMIT"]`
+and so on — silently drops every key this helper gains afterwards, and Django
+then falls back to django-axes's own default for it. That reads exactly like a
+pinned setting and is the inheritance
+[#16](https://github.com/tclancy/abi-django-utils/issues/16) exists to stop, so
+the one pattern that cannot drift is the one above. `recordclub` unpacks
+key-by-key today and so does not yet read
+`AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT`.
+
 `axes` ships models, so run `manage.py migrate` when you add it. Deploy these settings without migrating and the first login attempt — failed *or* successful — raises on a missing `axes_accessattempt` table, which is a login outage rather than the protection you were installing.
 
 `brute_force.axes_defaults()` returns:
@@ -165,13 +175,14 @@ locals().update(brute_force.axes_defaults())
 | `AXES_COOLOFF_TIME` | `1` (hour) | `cooloff_hours=` |
 | `AXES_LOCKOUT_PARAMETERS` | `[["ip_address"]]` | |
 | `AXES_RESET_ON_SUCCESS` | `True` | |
+| `AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT` | `True` | `cool_off_resets_on_failure=False` for a fixed window. `True` means `AXES_COOLOFF_TIME` is an hour of *silence*: a request made while already locked out is recorded as a further failure and restarts the clock. Settled as `True` in [#22](https://github.com/tclancy/abi-django-utils/issues/22) — it is what every app already ran, it is strictly better against a bot that hammers, and the costs are that the sole admin extends their own lockout by retrying (recovery: `manage.py axes_reset_ip <address>`) and that the attempt row is never reaped while its `post_data` keeps growing |
 | `AXES_ONLY_ADMIN_SITE` | `True` | `only_admin_site=False` to also watch a non-admin login |
 | `AXES_IPWARE_META_PRECEDENCE_ORDER` | `CF-Connecting-IP`, `X-Forwarded-For`, `REMOTE_ADDR` | omitted when `proxy_aware=False` |
 
 Three helpers compose the list settings, all idempotent and none of which mutate their argument:
 
 - `with_axes_app(installed_apps)` — appends `"axes"`
-- `with_axes_middleware(middleware)` — puts `AxesMiddleware` **last**, moving it there if it is already somewhere else; it maps a lockout signal onto the response, so it has to wrap the view
+- `with_axes_middleware(middleware)` — puts `AxesMiddleware` **last**, moving it there if it is already somewhere else. Two separate properties, because an earlier version of this line conflated them: the lockout *fires* from any index (the middleware is response-phase only, so position is not what makes it work), but `axes.helpers.get_lockout_response` **discards the view's response and builds a fresh one**, and Django runs the response phase bottom-up — so last is what lets every middleware above it decorate the refusal. Measured: axes first answers 429 with no `X-Frame-Options`, `Referrer-Policy` or `X-Content-Type-Options`; axes last answers 429 with all three
 - `with_axes_backend(backends)` — puts `AxesStandaloneBackend` **first**, so it sees the attempt before anything authenticates it
 
 #### Why the `ipware` extra is not optional

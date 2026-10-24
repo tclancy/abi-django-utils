@@ -108,21 +108,44 @@ def with_axes_middleware(middleware: Sequence[str]) -> list[str]:
     ``AXES_HTTP_RESPONSE_CODE``, which django-axes 8.3.1 defaults to **429**,
     not 403.
 
-    **Presence is the property that matters, not position.**
-    ``AxesMiddleware.__call__`` awaits ``get_response(request)`` before it
+    **Presence is what makes the lockout fire; position is what makes the
+    lockout response complete.** Those are two different properties and this
+    docstring has now been wrong about each of them in turn, so both are
+    pinned by tests.
+
+    *Firing* is position-independent. ``AxesMiddleware.__call__`` calls
+    ``get_response(request)`` -- awaits it, on the async path -- before it
     consults ``request.axes_locked_out``, so it is response-phase only and
-    wraps the view from any index. Measured independently twice --
+    returns the refusal from any index. Measured independently twice:
     ``tclancy/itemshop#372`` moved the entry to the front of ``MIDDLEWARE`` and
     the lockout still answered 429, and
-    ``test_the_flag_is_read_after_the_view_so_position_cannot_matter`` drives
-    the real middleware here. An earlier version of this docstring argued the
-    opposite ("it has to wrap the view rather than sit in front of it"), which
-    would have read as a constraint on an app that had it mid-list.
+    ``test_the_flag_is_read_after_the_view_so_the_lockout_fires_from_any_index``
+    drives the real middleware here. An earlier version of this docstring
+    argued the opposite ("it has to wrap the view rather than sit in front of
+    it"), which would have read as a constraint on an app that had it mid-list.
 
-    Last is kept as a convention, for two reasons that are both weaker than a
-    constraint: it is what django-axes documents, and it is where both apps
-    that already ran axes put it. An entry found elsewhere is moved so the
-    convention holds, not because leaving it would break the lockout.
+    *Completeness* is not. ``axes.helpers.get_lockout_response`` takes the
+    view's response as ``original_response`` and, on every path except a
+    caller-supplied ``AXES_LOCKOUT_CALLABLE``, discards it and builds a fresh
+    one. Django runs the response phase bottom-up, so **last** means axes
+    substitutes first and every middleware above it still decorates the
+    refusal. Place axes higher and everything below it has decorated a
+    response that axes then throws away. Measured against Django's own
+    middleware in
+    ``test_axes_above_other_middleware_loses_their_response_phase``:
+
+    =========================  =======================================
+    ``AxesMiddleware`` last    429 with ``X-Frame-Options``,
+                               ``Referrer-Policy``,
+                               ``X-Content-Type-Options``
+    ``AxesMiddleware`` first   429 with none of them
+    =========================  =======================================
+
+    So last is a real constraint on the security headers of the refusal, not
+    merely the convention django-axes documents and the position both apps
+    here that already ran axes chose. An entry found elsewhere in the list is
+    moved rather than left, and the lockout a mid-list app was already getting
+    was firing correctly and shipping bare.
     """
     return [*(m for m in middleware if m != AXES_MIDDLEWARE), AXES_MIDDLEWARE]
 
@@ -171,8 +194,9 @@ def axes_defaults(
     database handler returns before the ``get_or_create``, so the refused
     request is not recorded at all.
 
-    The trade, which is abi-django-utils#22 and is **Tom's to settle**, not
-    this helper's:
+    The trade, settled as ``True`` in abi-django-utils#22 on the grounds
+    below. Recorded rather than left open, because the reasoning is what a
+    future reader needs in order to reopen it deliberately:
 
     * ``True`` is strictly better against a bot that hammers -- its own
       persistence keeps it locked out -- and equal against one that backs off

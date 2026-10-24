@@ -10,7 +10,10 @@ own default resolves every tunnelled request to the proxy. A test that only
 compares the list to itself cannot tell a live pin from a dead one.
 """
 
+import ast
 import importlib.util
+import re
+from pathlib import Path
 
 import pytest
 from django.core.exceptions import ImproperlyConfigured
@@ -28,6 +31,25 @@ PROXY_IP = "172.28.0.1"
 CLIENT_IP = "198.51.100.7"
 #: What a client can put in ``X-Forwarded-For`` for free.
 SPOOFED_IP = "203.0.113.9"
+
+
+def assert_conftest_pins_no_axes_settings():
+    """Guard the two tests that claim to read django-axes's *own* defaults.
+
+    They read ``axes.conf.settings``, which is the **merged** value: ``axes/conf.py``
+    does ``settings.AXES_X = getattr(settings, "AXES_X", <default>)``, so by the time
+    anything can read it, the key is present in Django's settings whichever side put
+    it there. Checking for its absence there is therefore impossible, and the only
+    thing that could actually shadow upstream is this suite's own settings.
+
+    So assert on the source of ``tests/conftest.py`` instead. If anyone adds an
+    ``AXES_`` key to ``settings.configure(...)``, the two tests below keep passing
+    while silently becoming assertions about our test config -- which is the whole
+    failure mode this guard exists to make loud.
+    """
+    conftest = Path(__file__).with_name("conftest.py").read_text()
+    offenders = [line.strip() for line in conftest.splitlines() if re.match(r"\s*AXES_\w+\s*=", line)]
+    assert not offenders, f"conftest.py now pins axes settings, so these tests no longer measure upstream: {offenders}"
 
 
 @pytest.fixture
@@ -411,33 +433,85 @@ class TestCoolOffResetsOnFailure:
         """
         from axes.conf import settings as axes_settings
 
+        assert_conftest_pins_no_axes_settings()
         assert axes_settings.AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT is True
 
-    def test_the_setting_is_read_by_the_handler_this_helper_targets(self):
-        """The pin is live, not a list of strings axes never looks at.
+    def test_both_upstream_reads_the_false_arm_needs_are_still_there(self):
+        """The pin is live, and ``False`` needs *two* reads, not one.
 
         ``AXES_IPWARE_META_PRECEDENCE_ORDER`` taught this module that a pinned
-        setting can be inert -- axes reads it only when ipware is installed.
-        The same question has to be asked of this key, and the answer is a
-        different one: ``axes.handlers.database`` consults it unconditionally
-        in ``user_login_failed``, which is the handler ``AXES_HANDLER`` selects
-        by default. Asserted against the real source so that a release which
-        moved or dropped the read is caught here rather than in production.
+        setting can be inert -- axes reads it only when ipware is installed --
+        so the same question has to be asked of this key. The answer is two
+        places, and they are not independent:
+
+        * ``AxesStandaloneBackend.authenticate`` is the one that sets
+          ``request.axes_locked_out`` when the setting is ``False``.
+        * ``AxesDatabaseHandler.user_login_failed`` early-returns on
+          ``not setting and request.axes_locked_out`` -- which is
+          **unreachable without the backend's read above**.
+
+        So an upstream release that dropped only the backend's read would make
+        ``cool_off_resets_on_failure=False`` silently inert while the handler's
+        read still looked present. Asserting only the handler is what left that
+        gap; this asserts both.
+
+        A source read rather than a behavioural one on purpose: the ``False``
+        arm needs a real login flow to observe, and this library ships no
+        login view. ``recordclub`` has that flow and pins the ``True``
+        behaviour there. This is the proportionate instrument for a library
+        whose whole output is a settings dict -- it catches the upstream
+        removal, and does not pretend to be an end-to-end test.
         """
-        import inspect
+        import axes.backends
+        import axes.handlers.database
 
-        from axes.handlers.database import AxesDatabaseHandler
+        key = "AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT"
 
-        source = inspect.getsource(AxesDatabaseHandler.user_login_failed)
-        assert "AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT" in source
+        # Read via the AST rather than ``inspect.getsource`` on the two
+        # functions, for two reasons found while writing this. ``authenticate``
+        # is wrapped by axes's own ``@toggleable``, which sets no
+        # ``__wrapped__`` -- so ``getsource`` on the attribute returns the
+        # three-line wrapper and the arm would have passed for *any* key, or
+        # for none. And a plain substring search over source text matches a
+        # mention in a comment; the AST has no comments in it, so a hit is a
+        # real attribute access in executable code.
+        for module in (axes.backends, axes.handlers.database):
+            names = {
+                node.attr
+                for node in ast.walk(ast.parse(Path(module.__file__).read_text()))
+                if isinstance(node, ast.Attribute)
+            }
+            assert key in names, f"{module.__name__} no longer reads {key}; the False arm may be inert"
+            # Reachability control, and it names the coupling rather than an
+            # arbitrary second attribute: ``axes_locked_out`` is the flag the
+            # backend sets and the handler reads, so it is what makes these two
+            # reads one mechanism instead of two coincidences. A walk that
+            # found the key but not this is reading something unexpected.
+            assert "axes_locked_out" in names, (
+                f"the AST walk over {module.__name__} did not find the flag the two reads share"
+            )
 
 
-class TestTheRefusalIsA429AndThePositionIsNotLoadBearing:
-    """The two claims ``with_axes_middleware``'s docstring used to get wrong.
+class TestTheRefusalIsA429AndWhatPositionDoesAndDoesNotDecide:
+    """The claims ``with_axes_middleware``'s docstring has got wrong, in order.
 
-    abi-django-utils#22, second item. Both are upstream facts rather than
-    properties of this module's output, which is exactly why they were wrong
-    for as long as they were: nothing in the suite drove them.
+    abi-django-utils#22, second item. These are upstream facts rather than
+    properties of this module's output, which is exactly why they stayed wrong
+    for as long as they did: nothing in the suite drove them.
+
+    Three generations of one sentence, worth keeping because the second was
+    wrong in the more dangerous direction than the first:
+
+    1. "it has to wrap the view rather than sit in front of it" -- wrong
+       reason, right conclusion (last). Would have read as a hard constraint
+       to an app that had the entry mid-list.
+    2. "being present is not the property that matters" / position cannot
+       matter -- right about *firing*, wrong about the refusal's headers, and
+       permissive where the first was merely confusing. It came from measuring
+       the status code under two positions, which is the one property that
+       genuinely is position-independent.
+    3. Presence makes it fire; last makes the substituted response inherit the
+       response phase of everything above it. Both arms below.
     """
 
     def test_the_lockout_status_is_429_not_403(self):
@@ -449,9 +523,10 @@ class TestTheRefusalIsA429AndThePositionIsNotLoadBearing:
         """
         from axes.conf import settings as axes_settings
 
+        assert_conftest_pins_no_axes_settings()
         assert axes_settings.AXES_HTTP_RESPONSE_CODE == 429
 
-    def test_the_flag_is_read_after_the_view_so_position_cannot_matter(self):
+    def test_the_flag_is_read_after_the_view_so_the_lockout_fires_from_any_index(self):
         """Drive the real middleware: it is response-phase only.
 
         ``get_response`` here stands in for the view, and sets the flag the way
@@ -461,8 +536,13 @@ class TestTheRefusalIsA429AndThePositionIsNotLoadBearing:
         that reads the request after the view has run wraps that view from any
         index in ``MIDDLEWARE``.
 
-        This is the arm that makes "presence, not position" a measurement here
-        rather than a quotation of tclancy/itemshop#372.
+        This is the arm that makes "presence is what makes it fire" a
+        measurement here rather than a quotation of tclancy/itemshop#372. It
+        says nothing about whether position matters for anything *else* on the
+        refusal -- see
+        ``test_axes_above_other_middleware_loses_their_response_phase``, which
+        is the half this test's former name
+        ("...so_position_cannot_matter") wrongly claimed to have covered.
         """
         from axes.middleware import AxesMiddleware
 
@@ -493,3 +573,58 @@ class TestTheRefusalIsA429AndThePositionIsNotLoadBearing:
             response = AxesMiddleware(view)(request)
 
         assert response.status_code == 200
+
+    def test_axes_above_other_middleware_loses_their_response_phase(self):
+        """Position is a constraint on the refusal's headers, not on the 429.
+
+        ``axes.helpers.get_lockout_response`` takes the view's response as
+        ``original_response`` and, on every path but a caller-supplied
+        ``AXES_LOCKOUT_CALLABLE``, discards it and builds a fresh one. Django
+        runs the response phase bottom-up, so where axes sits decides which
+        middleware get to decorate the response it substitutes.
+
+        Both arms are asserted in one test because the finding *is* the
+        difference between them: either alone is a 429 and looks like a pass.
+        The status code is identical in both, which is exactly why measuring
+        only the status code licensed the wrong conclusion about position.
+        """
+        from axes.middleware import AxesMiddleware
+        from django.middleware.clickjacking import XFrameOptionsMiddleware
+        from django.middleware.security import SecurityMiddleware
+
+        def view(request):
+            request.axes_locked_out = True
+            request.axes_credentials = {"username": "someone"}
+            return HttpResponse("the login form", status=200)
+
+        def compose(*middleware):
+            """Build the chain the way Django does: last in the list is innermost."""
+            handler = view
+            for cls in reversed(middleware):
+                handler = cls(handler)
+            return handler
+
+        header = "X-Frame-Options"
+        with override_settings(
+            AXES_ENABLED=True,
+            SECURE_REFERRER_POLICY="same-origin",
+            SECURE_CONTENT_TYPE_NOSNIFF=True,
+            X_FRAME_OPTIONS="DENY",
+        ):
+            last = compose(SecurityMiddleware, XFrameOptionsMiddleware, AxesMiddleware)(
+                RequestFactory().post("/admin/login/", REMOTE_ADDR=CLIENT_IP)
+            )
+            first = compose(AxesMiddleware, SecurityMiddleware, XFrameOptionsMiddleware)(
+                RequestFactory().post("/admin/login/", REMOTE_ADDR=CLIENT_IP)
+            )
+
+        assert last.status_code == 429
+        assert first.status_code == 429, "the 429 is why position looked irrelevant"
+
+        assert last[header] == "DENY"
+        assert last["Referrer-Policy"] == "same-origin"
+        assert last["X-Content-Type-Options"] == "nosniff"
+
+        assert header not in first
+        assert "Referrer-Policy" not in first
+        assert "X-Content-Type-Options" not in first
