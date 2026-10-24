@@ -14,6 +14,7 @@ import importlib.util
 
 import pytest
 from django.core.exceptions import ImproperlyConfigured
+from django.http import HttpResponse
 from django.test import RequestFactory, override_settings
 from django.utils.module_loading import import_string
 
@@ -206,6 +207,7 @@ class TestAxesDefaults:
             "AXES_COOLOFF_TIME",
             "AXES_LOCKOUT_PARAMETERS",
             "AXES_RESET_ON_SUCCESS",
+            "AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT",
             "AXES_ONLY_ADMIN_SITE",
             "AXES_IPWARE_META_PRECEDENCE_ORDER",
         }
@@ -352,3 +354,142 @@ class TestAxesResolvesTheRealClient:
         from axes.conf import settings as axes_settings
 
         assert axes_settings.AXES_IPWARE_META_PRECEDENCE_ORDER == ("REMOTE_ADDR",)
+
+
+class TestCoolOffResetsOnFailure:
+    """Tests for the ``AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT`` pin.
+
+    abi-django-utils#22. The value is deliberately the one django-axes already
+    defaults to, which makes every assertion below easy to write and easy to
+    write *uselessly*: an assertion that the emitted value is ``True`` passes
+    identically whether the helper pins it or the key is absent and upstream
+    supplied it. So the membership arm (``test_required_keys_present``) and
+    ``test_the_upstream_default_is_true`` are both load-bearing here -- the
+    first says the key is *ours*, the second says what we would be inheriting
+    if it were not.
+    """
+
+    def test_defaults_to_the_behaviour_every_app_runs_today(self):
+        """``True`` is behaviour-preserving, not a preference.
+
+        No consuming app pinned this key, so all of them inherited ``True``
+        from django-axes. ``recordclub`` -- the only app consuming this helper
+        -- left it there deliberately and pinned it with a behavioural test
+        (``TheCooloffSlidesOnEveryRequestDuringLockoutTest``). A helper that
+        emitted ``False`` would have flipped a security control's behaviour in
+        the app that asked for this ticket.
+        """
+        assert brute_force.axes_defaults()["AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT"] is True
+
+    def test_a_fixed_window_can_be_asked_for(self):
+        """The escape hatch, in the shape ``proxy_aware`` established.
+
+        An app that wants an hour from the failure that crossed the limit --
+        rather than an hour of silence -- asks for it in one keyword instead of
+        a seventh inlined ``AXES_`` assignment, which is the drift #16 exists
+        to stop.
+        """
+        result = brute_force.axes_defaults(cool_off_resets_on_failure=False)
+        assert result["AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT"] is False
+
+    def test_the_other_values_are_unaffected_by_the_flag(self):
+        """Two differing inputs, so neither result can be a hardcoded dict."""
+        on = brute_force.axes_defaults(cool_off_resets_on_failure=True)
+        off = brute_force.axes_defaults(cool_off_resets_on_failure=False)
+        del on["AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT"]
+        del off["AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT"]
+        assert on == off
+
+    def test_the_upstream_default_is_true(self):
+        """What an unpinned app inherits, read from axes rather than asserted.
+
+        This is the counterfactual the pin exists for. If a django-axes release
+        ever flips this default, the pin above keeps every consuming app on
+        today's behaviour and this test is what says the inheritance changed --
+        which is the whole argument for pinning a key whose value already
+        matches the default.
+        """
+        from axes.conf import settings as axes_settings
+
+        assert axes_settings.AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT is True
+
+    def test_the_setting_is_read_by_the_handler_this_helper_targets(self):
+        """The pin is live, not a list of strings axes never looks at.
+
+        ``AXES_IPWARE_META_PRECEDENCE_ORDER`` taught this module that a pinned
+        setting can be inert -- axes reads it only when ipware is installed.
+        The same question has to be asked of this key, and the answer is a
+        different one: ``axes.handlers.database`` consults it unconditionally
+        in ``user_login_failed``, which is the handler ``AXES_HANDLER`` selects
+        by default. Asserted against the real source so that a release which
+        moved or dropped the read is caught here rather than in production.
+        """
+        import inspect
+
+        from axes.handlers.database import AxesDatabaseHandler
+
+        source = inspect.getsource(AxesDatabaseHandler.user_login_failed)
+        assert "AXES_RESET_COOL_OFF_ON_FAILURE_DURING_LOCKOUT" in source
+
+
+class TestTheRefusalIsA429AndThePositionIsNotLoadBearing:
+    """The two claims ``with_axes_middleware``'s docstring used to get wrong.
+
+    abi-django-utils#22, second item. Both are upstream facts rather than
+    properties of this module's output, which is exactly why they were wrong
+    for as long as they were: nothing in the suite drove them.
+    """
+
+    def test_the_lockout_status_is_429_not_403(self):
+        """The docstring said "the 403 the client sees". axes says 429.
+
+        Pinned rather than corrected-and-forgotten, because the next person to
+        write "403" into a changelog or a runbook will be reading the same
+        default this reads.
+        """
+        from axes.conf import settings as axes_settings
+
+        assert axes_settings.AXES_HTTP_RESPONSE_CODE == 429
+
+    def test_the_flag_is_read_after_the_view_so_position_cannot_matter(self):
+        """Drive the real middleware: it is response-phase only.
+
+        ``get_response`` here stands in for the view, and sets the flag the way
+        ``AxesStandaloneBackend`` does during ``authenticate()``. The
+        middleware still returns the lockout refusal, which it could only do by
+        reading the flag *after* calling ``get_response`` -- and a middleware
+        that reads the request after the view has run wraps that view from any
+        index in ``MIDDLEWARE``.
+
+        This is the arm that makes "presence, not position" a measurement here
+        rather than a quotation of tclancy/itemshop#372.
+        """
+        from axes.middleware import AxesMiddleware
+
+        def view(request):
+            request.axes_locked_out = True
+            request.axes_credentials = {"username": "someone"}
+            return HttpResponse("the login form", status=200)
+
+        request = RequestFactory().post("/admin/login/", REMOTE_ADDR=CLIENT_IP)
+        with override_settings(AXES_ENABLED=True):
+            response = AxesMiddleware(view)(request)
+
+        assert response.status_code == 429
+
+    def test_an_unflagged_request_passes_straight_through(self):
+        """The negative control: the middleware is not a blanket refusal.
+
+        Without this, the test above passes for a middleware that returns 429
+        unconditionally.
+        """
+        from axes.middleware import AxesMiddleware
+
+        def view(request):
+            return HttpResponse("the login form", status=200)
+
+        request = RequestFactory().post("/admin/login/", REMOTE_ADDR=CLIENT_IP)
+        with override_settings(AXES_ENABLED=True):
+            response = AxesMiddleware(view)(request)
+
+        assert response.status_code == 200
