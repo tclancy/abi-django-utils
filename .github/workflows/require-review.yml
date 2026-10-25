@@ -29,9 +29,13 @@ name: Require Code Review
 # `ubuntu-latest`, so this job needs no language runtime and no dependency
 # install.
 #
-# NOT A MERGE BLOCK. Branch protection is unavailable on this account's private
-# repos and is not configured here; the red X is backpressure for autonomous
-# agents, which is what the rollout asked for.
+# NOT A MERGE BLOCK. Measured 2026-10-25: `gh api repos/.../rulesets` returns
+# `[]` on this repo. (Branch protection itself is not readable here -- the bot
+# App gets 403 on `branches/main/protection` -- so this is "no rulesets", not
+# "nothing could block". An earlier draft of this paragraph said protection is
+# unavailable on GitHub Free; that is a statement about PRIVATE repos and this
+# repo is public, where Free does offer it.) The red X is backpressure for
+# autonomous agents, which is what the rollout asked for.
 
 on:
   pull_request:
@@ -124,13 +128,25 @@ jobs:
           echo "number=${number}" >> "$GITHUB_OUTPUT"
           echo "sha=${sha}" >> "$GITHUB_OUTPUT"
 
-      # A cross-repository PR's `GITHUB_TOKEN` is read-only, so `statuses:
-      # write` above is not granted and the POST below would 403 -- turning
-      # every outside contribution into a red *workflow* run, which is worse
-      # than no gate. This repo is PUBLIC, so that is a live shape. The
-      # reviewer skips the same PRs for the matching reason (it cannot post
-      # inline comments either). Outside contributions get Tom's own review;
-      # this gate is backpressure on agent PRs.
+      # Skip cross-repository PRs. Two reasons, and only the first is a
+      # token limitation:
+      #
+      #   1. On the `pull_request` trigger a fork PR's `GITHUB_TOKEN` is
+      #      read-only, so the `statuses: write` declared above is NOT granted
+      #      and the POST below would 403 -- turning every outside
+      #      contribution into a red *workflow* run, which is worse than no
+      #      gate. This repo is PUBLIC, so that is a live shape.
+      #   2. On `issue_comment` and `pull_request_review` the job runs in the
+      #      base-repo context and the token IS writable, so the status could
+      #      be posted. Skipping those is a POLICY choice, not a limitation:
+      #      the reviewer declines fork PRs too (it cannot post inline
+      #      comments back across the boundary), so a status demanding a
+      #      review nothing will perform is a red X with no remedy. The known
+      #      consequence: a maintainer who types `/review` on an outside PR
+      #      gets a real review and no status to show for it.
+      #
+      # Outside contributions get Tom's own review; this gate is backpressure
+      # on agent PRs.
       #
       # THE DISCRIMINATOR IS `head.repo.full_name`, NOT `head.repo.fork`. See
       # the long note on the same question in `claude-code-review.yml`.
@@ -149,9 +165,12 @@ jobs:
           else
             head_repo="$(gh api "repos/${REPO}/pulls/${NUMBER}" --jq '.head.repo.full_name')"
           fi
-          # Default to "yes, cross-repo" when the head repo cannot be read at
-          # all: a DELETED head repo reports `null`, and skipping is the safe
-          # direction (no status is better than a 403-failed job).
+          # A DELETED head repo reports the literal string `null`, which is
+          # not `$REPO`, so it lands in the cross-repo branch and is skipped --
+          # the safe direction. Note the narrow scope of that claim: under
+          # `set -euo pipefail` an `gh api` *failure* kills this step rather
+          # than falling back to anything, and the `if: failure()` step at the
+          # end of this job is what publishes a verdict in that case.
           if [ "$head_repo" = "$REPO" ]; then
             fork=false
           else
@@ -194,6 +213,15 @@ jobs:
           }
 
           if [ -z "${REVIEWER_TOKEN}" ]; then
+            # The description is capped at 140 characters by GitHub, so it
+            # names the first step only; the notice carries both. The second
+            # step is easy to miss and is just as load-bearing: this gate
+            # matches on the login `claude[bot]`, which exists only if the
+            # Claude GitHub App is installed on this repo. Secret without App
+            # => the reviewer's comments post under a different login, the
+            # gate never matches, and the PR sits red with a remedy that
+            # cannot work.
+            echo "::notice::Review gate not provisioned. Two steps, both Tom's: (1) add the CLAUDE_CODE_OAUTH_TOKEN repo secret; (2) install the Claude GitHub App on this repo, so the reviewer posts as claude[bot] - this gate matches on that login."
             publish pending \
               "Not provisioned: add the CLAUDE_CODE_OAUTH_TOKEN repo secret to enable the reviewer, then re-gate this PR."
             exit 0
@@ -246,3 +274,28 @@ jobs:
           verdict="$(jq -f .github/review-gate.jq gate-input.json)"
           publish "$(printf '%s' "$verdict" | jq -r .state)" \
                   "$(printf '%s' "$verdict" | jq -r .description)"
+
+      # Finding from review: the `trap` above is installed inside that step, so
+      # a `gh api` failure in *Resolve PR number and head SHA* or *Is this a
+      # cross-repository PR?* would fail the job and skip it -- leaving the
+      # head's PREVIOUS status standing, which on an approved-then-pushed PR is
+      # a stale GREEN. That is the exact thing the trap exists to prevent, one
+      # scope up. This step closes it for the job.
+      #
+      # `steps.pr.outputs.sha` is tested because there is nowhere to post a
+      # status if the resolution step is what died, and the fork check is
+      # honoured because a fork PR's token cannot write one anyway.
+      - name: Publish an error verdict if any step above failed
+        if: failure() && steps.pr.outputs.sha != '' && steps.fork.outputs.fork != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.pr.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${REPO}/statuses/${SHA}" \
+            -f state="error" \
+            -f context="dispatch/require-review" \
+            -f description="Gate could not be evaluated - a step failed before the verdict. This is a gate failure, not a review verdict." \
+            -f target_url="${RUN_URL}" >/dev/null

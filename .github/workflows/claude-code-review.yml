@@ -67,6 +67,14 @@ jobs:
     # and that spelling skipped 100% of its PRs while reading as a correctly
     # installed gate. Comparing full names asks the question actually being
     # asked -- did this branch come from somewhere else?
+    # `startsWith` and not `contains` on the `/review` trigger: a comment that
+    # merely QUOTES a review URL -- `repos/tclancy/abi-django-utils/pulls/5/reviews`
+    # -- contains the substring, and under `contains` would spawn a full model
+    # review nobody asked for. `#320` section 5 is cited twice in this file as
+    # the reason `synchronize` is off; an accidental run from a pasted link is
+    # the same cost. The gate's own refusal text says "Comment /review", which
+    # is the spelling `startsWith` accepts. `@claude review` keeps `contains`,
+    # because an @-mention is normally mid-sentence.
     if: |
       (github.event_name == 'pull_request'
         && github.event.pull_request.head.repo.full_name == github.repository
@@ -74,7 +82,7 @@ jobs:
         && !startsWith(github.event.pull_request.title, 'chore'))
       || (github.event_name == 'issue_comment'
         && github.event.issue.pull_request != null
-        && (contains(github.event.comment.body, '/review')
+        && (startsWith(github.event.comment.body, '/review')
             || contains(github.event.comment.body, '@claude review')))
     runs-on: ubuntu-latest
     permissions:
@@ -107,7 +115,7 @@ jobs:
             echo "ready=yes" >> "$GITHUB_OUTPUT"
           else
             echo "ready=no" >> "$GITHUB_OUTPUT"
-            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set - review skipped. Add the repo secret to enable the gate (issue #24)."
+            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set - review skipped. Two provisioning steps, both Tom's (issue #24): add the repo secret, and install the Claude GitHub App so the reviewer posts as claude[bot], which is the login .github/review-gate.jq matches on."
           fi
 
       - name: Resolve PR head SHA
@@ -136,6 +144,16 @@ jobs:
           # otherwise review the default branch.
           ref: ${{ steps.pr.outputs.sha }}
 
+      # BUMPING THIS PIN IS A GATE CHANGE, not a dependency bump.
+      # `.github/review-gate.jq` decides whether a bot comment represents a
+      # real review by matching the action's own status lines anchored at byte
+      # 0 (`^\*{0,2}Claude (Code is working|finished|encountered an error)`).
+      # At this SHA `createCommentBody` emits those at the start of the body.
+      # If a later version prepends anything -- an HTML marker, a blank line --
+      # the in-flight comment stops being recognised as a status comment and is
+      # counted as a review, which is metaframework#687 restored. Re-check the
+      # three shapes in `tests/test_review_gate.py` against the new source
+      # before merging a bump.
       - name: Run Claude Code Review
         if: steps.gate.outputs.ready == 'yes'
         uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248

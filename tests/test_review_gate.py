@@ -40,27 +40,38 @@ AFTER_HEAD = "2026-10-25T04:00:00Z"
 
 JQ = shutil.which("jq")
 
-
-def test_jq_is_available_wherever_this_suite_is_graded():
-    """Reachability control for the whole module.
-
-    Everything below is skipped when ``jq`` is absent, and a skipped gate test
-    reads exactly like a passing one. That trade is fine on a laptop and is not
-    fine in CI, which is the only run anyone grades a PR on -- so in CI a
-    missing ``jq`` is a failure, not a skip. ``ubuntu-latest`` ships jq, so
-    this asserts a property of the runner rather than adding a dependency.
-    """
-    if os.environ.get("CI"):
-        assert JQ is not None, "jq is missing from the CI runner; every gate test below silently skipped"
-    else:
-        pytest.skip("not CI; the jq-driven tests skip on their own if jq is absent")
-
-
-pytestmark = pytest.mark.skipif(JQ is None, reason="jq is not installed")
+# A skipped gate test reads exactly like a passing one. That trade is fine on a
+# laptop and is not fine in CI, which is the only run anyone grades a PR on --
+# so in CI a missing ``jq`` is a failure, not a skip.
+#
+# THIS IS AN IMPORT-TIME RAISE AND NOT A TEST, because a test cannot do this
+# job. An earlier draft asserted it in ``test_jq_is_available_...`` and guarded
+# the module with ``pytestmark = pytest.mark.skipif(JQ is None, ...)``. A
+# module-level ``pytestmark`` applies to EVERY collected item regardless of
+# definition order, so it covered the control too: measured 2026-10-25, with
+# ``CI=true`` and ``jq`` absent that module reported **53 skipped, exit 0** --
+# the one test whose entire job was to prevent a silent skip, silently skipped.
+#
+# ``ubuntu-latest`` ships jq, so this asserts a property of the runner rather
+# than adding a dependency.
+if os.environ.get("CI") and JQ is None:
+    raise RuntimeError(
+        "jq is missing from this runner, so every verdict test in this module would "
+        "silently skip and the review gate would ship ungraded. ubuntu-latest ships "
+        "jq; if this fires, the runner image changed."
+    )
 
 
 def grade(**overrides) -> dict:
-    """Run the committed jq program over one gate input and return the verdict."""
+    """Run the committed jq program over one gate input and return the verdict.
+
+    The skip lives here rather than on a module-level mark so that it reaches
+    exactly the tests that need jq -- see the import-time raise above for what
+    the mark did to the control that was supposed to backstop it. The ~20
+    workflow-property tests below parse YAML and need no jq at all.
+    """
+    if JQ is None:
+        pytest.skip("jq is not installed")
     payload = {
         "number": 42,
         "head_committed_at": HEAD_AT,
@@ -418,9 +429,15 @@ def test_both_workflows_queue_concurrent_runs_instead_of_cancelling_them():
 def test_publishes_pending_not_failure_when_the_reviewer_token_is_unset():
     """The repo has no ``CLAUDE_CODE_OAUTH_TOKEN``. A red X nobody but Tom can
     clear is the workload transfer this rollout was chosen to avoid."""
-    body = STATUS_WORKFLOW.read_text()
-    unset_branch = body.split('if [ -z "${REVIEWER_TOKEN}" ]; then', 1)[1].split("fi", 1)[0]
+    lines = STATUS_WORKFLOW.read_text().splitlines()
+    start = next(i for i, ln in enumerate(lines) if 'if [ -z "${REVIEWER_TOKEN}" ]; then' in ln)
+    # Line boundaries, not `split("fi")`: that is a SUBSTRING split and it cut
+    # at the "fi" inside the word "first" in a comment, silently dropping the
+    # one line this test exists to assert on.
+    end = next(i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln.strip() == "fi")
+    unset_branch = "\n".join(lines[start + 1 : end])
     assert "publish pending" in unset_branch
+    assert "publish failure" not in unset_branch
     assert "CLAUDE_CODE_OAUTH_TOKEN" in unset_branch
 
 
@@ -460,9 +477,13 @@ def test_no_github_expression_is_interpolated_into_any_run_block():
     workflow file, and a well-formed one splicing a PR title is a command
     injection. Every value must arrive through ``env:``.
     """
+    seen = 0
     for path in (STATUS_WORKFLOW, REVIEWER_WORKFLOW):
         for block in _run_blocks(_load(path)):
+            seen += 1
             assert "${{" not in block, f"{path.name}: expression inside a run: block"
+    # Floor. An absence sweep over an empty collection is a tautology.
+    assert seen == 6, f"expected 6 run: blocks across the two workflows, saw {seen}"
 
 
 def test_the_reviewer_skips_exactly_one_title_prefix_and_the_gate_exempts_none():
@@ -483,12 +504,17 @@ def test_the_author_exemptions_agree_between_the_two_files():
     assert reviewer_skips == gate_exempts == {"dependabot[bot]"}
 
 
+def _reviewer_action() -> dict:
+    job = _load(REVIEWER_WORKFLOW)["jobs"]["claude-review"]
+    return next(s for s in job["steps"] if str(s.get("uses", "")).startswith("anthropics/claude-code-action@"))
+
+
 def test_the_reviewer_carries_all_five_config_layers():
     """Each layer fails quietly and only the next one's failure appears once
     the prior is fixed, so they are asserted together rather than discovered
     one CI run at a time."""
     job = _load(REVIEWER_WORKFLOW)["jobs"]["claude-review"]
-    action = next(s for s in job["steps"] if str(s.get("uses", "")).startswith("anthropics/claude-code-action@"))
+    action = _reviewer_action()
     assert job["permissions"]["id-token"] == "write"  # layer 1
     assert "mcp__github_inline_comment__create_inline_comment" in action["with"]["claude_args"]  # layer 2
     assert action["with"]["track_progress"] is True  # layer 3
@@ -500,9 +526,129 @@ def test_the_reviewer_carries_all_five_config_layers():
 
 
 def test_every_third_party_action_is_pinned_to_a_sha():
+    seen = 0
     for path in (STATUS_WORKFLOW, REVIEWER_WORKFLOW):
         for job in _load(path).get("jobs", {}).values():
             for step in job.get("steps", []):
                 uses = step.get("uses")
                 if uses:
+                    seen += 1
                     assert re.search(r"@[0-9a-f]{40}$", uses), f"{path.name}: {uses} is not SHA-pinned"
+    # Floor. Without it this passes on a reader that found no `uses:` at all --
+    # a renamed key or a restructured document makes the sweep vacuous rather
+    # than red. Two actions in the reviewer, one in the status workflow.
+    assert seen == 3, f"expected 3 pinned actions across the two workflows, saw {seen}"
+
+
+def test_the_reviewer_keys_the_fork_skip_on_full_name_not_on_the_fork_flag():
+    """``head.repo.fork`` is the wrong spelling, and here it would pass anyway.
+
+    It answers "is the head repo a fork of something" -- a property of the
+    REPO. ``tclancy/abi-django-utils`` is not itself a fork (measured
+    2026-10-25), so the wrong spelling behaves correctly in this repo today and
+    would surface only when the file is copied onward. On the sibling repo that
+    shipped this gate first it was load-bearing: ``tclancy/bluelinky`` IS a
+    fork, so that field is ``true`` for every same-repo branch and the wrong
+    spelling skipped 100% of its PRs while reading as an installed gate.
+
+    Comments are stripped before the absence check, because both files discuss
+    ``head.repo.fork`` in prose at length -- the control below is what proves
+    the stripping left something to read.
+    """
+    for path in (REVIEWER_WORKFLOW, STATUS_WORKFLOW):
+        code = "\n".join(ln for ln in path.read_text().splitlines() if not ln.lstrip().startswith("#"))
+        assert "head.repo.full_name" in code, path.name
+        assert "head.repo.fork" not in code, f"{path.name}: keyed on head.repo.fork, which is a repo property"
+
+
+def test_control_both_files_do_discuss_the_fork_flag_in_prose():
+    """Reachability control for the absence assertion above.
+
+    If the warning were ever deleted, the absence check would pass on a file
+    that no longer explains why the spelling matters -- and the next person to
+    copy it has nothing to read. This asserts the comment-stripped and
+    comment-included views genuinely differ.
+    """
+    for path in (REVIEWER_WORKFLOW, STATUS_WORKFLOW):
+        assert "head.repo.fork" in path.read_text(), f"{path.name}: the warning prose is gone"
+
+
+def test_the_secret_gate_actually_tests_the_secret():
+    """Layer 0, and the live failure if it is neutered.
+
+    Replacing the condition with a constant makes the action run with an empty
+    credential on every PR and fail its own validation -- a red X on every PR
+    here, which is exactly what shipping the status half was chosen to avoid.
+    """
+    job = _load(REVIEWER_WORKFLOW)["jobs"]["claude-review"]
+    gate = next(s for s in job["steps"] if s.get("id") == "gate")
+    assert gate["env"]["REVIEWER_TOKEN"].strip() == "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}"
+    assert 'if [ -n "${REVIEWER_TOKEN}" ]; then' in gate["run"]
+    assert "ready=yes" in gate["run"]
+    assert "ready=no" in gate["run"]
+
+
+def test_the_reviewer_turn_budget_is_pinned_to_the_measured_value():
+    """40 is itguy's measurement plus headroom (32 turns observed). A cap sized
+    to a broken gate starves a healthy one: three of itguy's five runs under 25
+    completed a real review and were failed anyway by the action's post-check.
+    """
+    action = _reviewer_action()
+    assert "--max-turns 40" in action["with"]["claude_args"]
+
+
+def test_the_review_trigger_does_not_fire_on_a_quoted_review_url():
+    """`startsWith`, not `contains`.
+
+    A comment quoting `repos/tclancy/abi-django-utils/pulls/5/reviews` contains
+    the substring `/review`, and under `contains` would spawn a full model
+    review nobody asked for -- the same burn `synchronize` was turned off to
+    avoid. The gate's own refusal text says "Comment /review", which is the
+    spelling `startsWith` accepts.
+    """
+    condition = _load(REVIEWER_WORKFLOW)["jobs"]["claude-review"]["if"]
+    assert "startsWith(github.event.comment.body, '/review')" in condition
+    assert "contains(github.event.comment.body, '/review')" not in condition
+
+
+def test_the_reviewer_does_not_auto_trigger_on_every_push():
+    """metaframework#320 section 5. With ``synchronize`` on, a 10-commit PR
+    fires 10 model reviews; ``reopened`` is the deliberate one-per-re-gate
+    trigger that replaces it."""
+    assert _triggers(REVIEWER_WORKFLOW)["pull_request"]["types"] == ["opened", "reopened"]
+
+
+def test_every_run_block_is_valid_shell():
+    """``bash -n`` over each extracted block.
+
+    A syntax error in the status workflow's third step kills it BEFORE the
+    ``trap`` is installed, so the gate publishes nothing and the
+    "never leave the last verdict standing" invariant is void -- while every
+    other test in this module stays green.
+    """
+    blocks = [b for path in (STATUS_WORKFLOW, REVIEWER_WORKFLOW) for b in _run_blocks(_load(path))]
+    # Floor: the reader must actually be finding blocks.
+    assert len(blocks) == 6, f"expected 6 run: blocks across the two workflows, saw {len(blocks)}"
+    for block in blocks:
+        subprocess.run(["bash", "-n"], input=block, text=True, capture_output=True, check=True)
+
+
+def test_control_bash_n_still_rejects_broken_shell():
+    """Reachability control for the sweep above: if ``bash -n`` ever stopped
+    refusing, that sweep would pass on anything."""
+    with pytest.raises(subprocess.CalledProcessError):
+        subprocess.run(
+            ["bash", "-n"], input='if [ -z "$X" ; then echo oops', text=True, capture_output=True, check=True
+        )
+
+
+def test_a_failed_resolution_step_still_publishes_a_verdict():
+    """The ``trap`` lives inside the third step, so a ``gh api`` failure in
+    either of the first two would skip it and leave the head's previous status
+    standing. The ``if: failure()`` step is what makes the stated invariant
+    true of the whole job rather than of one step."""
+    steps = _load(STATUS_WORKFLOW)["jobs"]["require-review"]["steps"]
+    final = steps[-1]
+    assert "failure()" in final["if"]
+    assert "steps.pr.outputs.sha" in final["if"]
+    assert "error" in final["run"]
