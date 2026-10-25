@@ -657,3 +657,49 @@ cd abi-django-utils
 uv sync
 uv run pytest
 ```
+
+## Code Review Gate
+
+Pull requests here are graded by two GitHub Actions workflows plus one jq
+program. If you are looking at a PR with a yellow `dispatch/require-review`,
+this section is why.
+
+| File | Job |
+|------|-----|
+| `.github/workflows/claude-code-review.yml` | Runs the reviewer and posts findings as inline comments. Fires on `opened` / `reopened`, and on a comment starting with `/review`. Never on `synchronize` — a 10-commit PR would otherwise fire 10 reviews. |
+| `.github/workflows/require-review.yml` | Publishes the `dispatch/require-review` commit status to the PR **head**, saying whether a review exists *for that head*. |
+| `.github/review-gate.jq` | The decision, as a pure function. JSON in, `{state, description}` out. Unit-tested by `tests/test_review_gate.py`. |
+
+### The three states you will see
+
+- **green** — a review exists for the current head commit.
+- **red** — either there is no review, or every review predates the head. Both
+  refusals name the remedy: comment `/review` on the PR and the reviewer runs
+  again, re-publishing the status.
+- **yellow / pending** — the gate is not provisioned (see below). Deliberately
+  not green: a reviewer that cannot run must not read like one that passed.
+
+This status blocks nothing. There are no rulesets on this repo; the red X is
+backpressure for the autonomous agents that open most PRs here.
+
+### Provisioning (two steps, both repo-admin)
+
+The gate ships unprovisioned and says so. To turn it on:
+
+1. Add a `CLAUDE_CODE_OAUTH_TOKEN` repository secret
+   (*Settings → Secrets and variables → Actions*).
+2. Install the **Claude GitHub App** on this repository.
+
+Step 2 is easy to miss and is just as load-bearing as step 1: the gate matches
+on the comment author `claude[bot]`, which only exists once the App is
+installed. With the secret but not the App, the reviewer's comments arrive
+under a different login, the gate never matches them, and the PR sits red with
+a remedy that cannot work.
+
+### Outside contributors
+
+Cross-repository (fork) PRs are skipped by both workflows and get a human
+review instead. Actions cannot post inline comments back across the fork
+boundary, and on the `pull_request` trigger a fork PR's token cannot write a
+commit status either — so a gate there would be a red X with no available
+remedy.
