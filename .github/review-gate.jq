@@ -164,6 +164,15 @@ def exempt_reason:
 #
 # `index(null)` returns null rather than erroring, so a comment with no author
 # needs no separate guard.
+#
+# THE CONTRACT, which both traps above are instances of: `$bots`/`$reviewers`
+# must be ARRAYS OF STRINGS and `.` must be a STRING. `index` is polymorphic --
+# given a string haystack it matches a SUBSTRING, given an array haystack it
+# matches a SUBSEQUENCE -- so a scalar on either side silently widens the
+# predicate rather than erroring. `reviewer_logins: "tclancy"` admits the login
+# `"cl"`. `require-review.yml` hardcodes array literals and a GitHub login is
+# always a string, so neither is reachable in production; it is reachable by a
+# hand-written input, which is what the tests feed it.
 def is_bot($bots): . as $l | ($bots | index($l)) != null;
 
 def candidates($bots; $reviewers):

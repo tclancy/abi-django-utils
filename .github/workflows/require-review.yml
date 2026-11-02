@@ -70,12 +70,22 @@ jobs:
   require-review:
     # For `issue_comment`, only run when the comment could change the answer:
     # the review bot posting or ticking its own comment (the self-heal path), or
-    # anyone asking for `/review`. Ordinary human discussion is skipped.
+    # anyone asking for a review. Ordinary human discussion is skipped.
+    #
+    # BOTH PHRASES, because `claude-code-review.yml` answers both and the two
+    # halves of one gate must not disagree about what asks for a review. This
+    # file accepted only `/review` until 2026-11-02; a reader who followed the
+    # reviewer's own documented `@claude review` got a review and no status to
+    # show for it. On a provisioned repo that self-heals -- the reviewer's
+    # `claude[bot]` comment re-fires this workflow -- but this repo is not
+    # provisioned, so there the omission produced nothing at all. Pinned by
+    # `test_the_two_halves_agree_on_what_asks_for_a_review`.
     if: >-
       github.event_name != 'issue_comment' ||
       (github.event.issue.pull_request &&
        (github.event.comment.user.login == 'claude[bot]' ||
-        contains(github.event.comment.body, '/review')))
+        contains(github.event.comment.body, '/review') ||
+        contains(github.event.comment.body, '@claude review')))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -196,7 +206,15 @@ jobs:
           # the ordering is load-bearing and the reasoning is at the branch.
           REVIEWER_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
-          set -euo pipefail
+          # `-E`, and it is not decoration. Without `errtrace` an ERR trap is
+          # NOT inherited by shell functions, so a failing `gh api` inside
+          # `publish` below killed this step with the trap never running --
+          # which is the one failure the trap is installed for. Measured
+          # 2026-11-02: `set -euo pipefail; f(){ false; }; trap 'echo X' ERR; f`
+          # prints nothing and exits 1; adding `-E` prints X. The `if: failure()`
+          # step at the end of this job covers it either way, so this makes the
+          # trap's own comment true rather than closing a gap.
+          set -Eeuo pipefail
 
           publish() {
             gh api -X POST "repos/${REPO}/statuses/${SHA}" \

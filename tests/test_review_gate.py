@@ -394,6 +394,29 @@ def _run_blocks(doc: dict) -> list[str]:
     return blocks
 
 
+def active_lines(text: str) -> str:
+    """``text`` with whole comment lines dropped, for assertions about what it DOES.
+
+    THE ONE IMPLEMENTATION. Three tests in this module had each retyped this
+    generator expression inline, and that is not only duplication: a mutation
+    round aimed at the helper landed on the FIRST copy instead and reported a
+    kill from an unrelated test, so the helper's own control was never driven
+    (2026-11-02). Four copies of a predicate are four things a mutant can hit
+    and one thing you can be sure you tested.
+
+    Two jobs. An absence assertion over raw text cannot tell a setting from a
+    paragraph explaining why that setting is wrong, and these files carry long
+    comments naming the wrong spellings on purpose. And the ``jq -n`` program
+    in ``require-review.yml`` has a ``#`` comment INSIDE it -- jq accepts it,
+    but a commented-out mapping has to read as missing rather than as present.
+
+    Contract, and both halves are asserted: a whole comment line is DROPPED
+    (not blanked, so raw line numbers do not survive) and an end-of-line ``#``
+    SURVIVES. See ``test_control_active_lines_keeps_an_end_of_line_comment``.
+    """
+    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+
 def _triggers(path: Path) -> dict:
     """YAML 1.1 parses a bare ``on:`` key as the boolean ``True``."""
     doc = _load(path)
@@ -560,7 +583,7 @@ def test_the_reviewer_keys_the_fork_skip_on_full_name_not_on_the_fork_flag():
     the stripping left something to read.
     """
     for path in (REVIEWER_WORKFLOW, STATUS_WORKFLOW):
-        code = "\n".join(ln for ln in path.read_text().splitlines() if not ln.lstrip().startswith("#"))
+        code = active_lines(path.read_text())
         assert "head.repo.full_name" in code, path.name
         assert "head.repo.fork" not in code, f"{path.name}: keyed on head.repo.fork, which is a repo property"
 
@@ -833,7 +856,7 @@ def test_an_unprovisioned_repo_with_a_real_review_still_reads_green():
     # describes removing -- an absence assertion over raw text cannot tell a
     # statement from a sentence about that statement, and this step's body is
     # mostly prose.
-    body = "\n".join(ln for ln in _publish_step()["run"].splitlines() if not ln.lstrip().startswith("#"))
+    body = active_lines(_publish_step()["run"])
     guard = 'if [ "$state" != "success" ] && [ -z "${REVIEWER_TOKEN}" ]; then'
     unprovisioned = body.split(guard, 1)
     assert len(unprovisioned) == 2, "no verdict-aware unprovisioned branch to assert on"
@@ -847,15 +870,22 @@ def test_an_unprovisioned_repo_with_a_real_review_still_reads_green():
 def test_the_unprovisioned_description_names_the_dependabot_secret_store():
     """The description a reader acts on. Naming the separate store is what
     stops the next person re-adding a secret that is already there."""
-    lines = _publish_step()["run"].splitlines()
-    # Line boundaries, not `split("fi")`. That is a SUBSTRING split, and the
-    # test immediately above this block in the file records it cutting at the
-    # "fi" inside a word in a comment and silently dropping the line it was
-    # asserting on. The same trap, twenty lines apart.
-    start = next(i for i, ln in enumerate(lines) if '[ -z "${REVIEWER_TOKEN}" ]; then' in ln)
-    end = next(i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln.strip() == "fi")
+    # Comment lines stripped FIRST, and the anchor is an EXACT stripped line.
+    #
+    # The first version of this test did neither, and both shortcuts are ones
+    # this module has already been bitten by. `split("fi")` is a substring
+    # split that cut at the "fi" inside a word in a comment -- recorded on
+    # `test_publishes_pending_not_failure_when_the_reviewer_token_is_unset`,
+    # ~400 lines above, which is where that story lives. And asserting
+    # presence over text that still carries comments is satisfied by prose:
+    # this branch opens with an 8-line comment block ABOUT the guard, so
+    # "Dependabot" and "publish pending" are one comment edit away from being
+    # true of the paragraph rather than of the code.
+    lines = [ln.strip() for ln in active_lines(_publish_step()["run"]).splitlines()]
+    start = lines.index('if [ "$state" != "success" ] && [ -z "${REVIEWER_TOKEN}" ]; then')
+    end = next(i for i, ln in enumerate(lines[start + 1 :], start + 1) if ln == "fi")
     branch = "\n".join(lines[start + 1 : end])
-    assert "publish pending" in branch
+    assert "publish pending" in branch, branch
     assert "publish failure" not in branch
     assert "Dependabot" in branch, branch
 
@@ -912,32 +942,38 @@ def test_the_failure_fallback_still_publishes_an_error_state():
 # --------------------------------------------------------------------------
 
 
-def active_lines(text: str) -> str:
-    """``text`` with comment lines stripped, for assertions about what it DOES.
-
-    Two jobs here. An absence assertion over raw text cannot tell a setting
-    from a paragraph explaining why that setting is wrong, and these files
-    carry long comments that name the wrong spellings on purpose. And the
-    ``jq -n`` program below has a ``#`` comment INSIDE it -- jq would accept it,
-    but a commented-out mapping has to read as missing rather than as present.
-
-    Driven to a failure in ``test_control_active_lines_really_removes_a_line``.
-    """
-    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
-
-
 def test_control_active_lines_really_removes_a_line():
     assert "bot_logins" not in active_lines("          # bot_logins: [...]\n")
     assert "bot_logins" in active_lines('          bot_logins: ["claude[bot]"],\n')
 
 
-def test_control_active_lines_alters_nothing_but_whole_comment_lines():
-    """Bounds the helper over the real files: the only lines it may change are
-    ones whose first non-space character is ``#``."""
+def test_control_active_lines_keeps_an_end_of_line_comment():
+    """The helper's CONTRACT, stated rather than restated.
+
+    An earlier version of this control asserted ``kept == [ln for ln in raw if
+    not ln.lstrip().startswith("#")]`` -- a verbatim copy of the helper's own
+    generator expression on the right-hand side. That pins the helper against
+    change but cannot describe its limitation, because it *is* the limitation.
+
+    What callers need to know is the boundary: WHOLE comment lines go, and an
+    end-of-line ``#`` survives. Every consumer in this module was checked
+    against that on 2026-11-02 -- ``_program()`` (no end-of-line ``#`` inside
+    the extracted jq slice) and the ``exit 0`` absence assertion (where an
+    end-of-line comment cannot carry it) -- so the surviving kind is harmless
+    here. If a future guard needs them gone, it needs a different helper, not
+    a wider one.
+    """
+    assert active_lines("x = 1  # keep me") == "x = 1  # keep me"
+    # A comment line is DROPPED, not blanked, so line numbers do not survive.
+    # Nothing in this module indexes the stripped text by raw line number --
+    # `_program()` searches it and the guards use `.index()` on the stripped
+    # list itself -- but a future guard that wants positions needs to know.
+    assert active_lines("  # drop me\nkeep") == "keep"
+    # And over the real files it must not be a no-op in either direction.
     for path in (STATUS_WORKFLOW, REVIEWER_WORKFLOW, GATE):
-        raw = path.read_text().splitlines()
-        kept = active_lines(path.read_text()).splitlines()
-        assert kept == [ln for ln in raw if not ln.lstrip().startswith("#")], path.name
+        raw, kept = path.read_text(), active_lines(path.read_text())
+        assert len(kept) < len(raw), f"{path.name}: stripped nothing at all"
+        assert kept.strip(), f"{path.name}: stripped everything"
 
 
 class TestTheInputBuilderIsExecutedAndNotOnlyRead:
@@ -1033,7 +1069,40 @@ class TestTheInputBuilderIsExecutedAndNotOnlyRead:
             "reviews": [{"user": {"login": f"reviewer-{n}"}, "state": "APPROVED"}],
         }
 
-    def _build(self, row: dict, tmp_path: Path) -> dict:
+    @staticmethod
+    def _raw_program() -> str:
+        """The same slice taken WITHOUT stripping comments.
+
+        This is the text production actually hands jq. ``_program()`` strips
+        comments first, which is correct for the assertions below (a
+        commented-out mapping must read as missing) -- but it means the
+        9-line ``#`` comment that lives INSIDE the jq program is never passed
+        to jq by any test. jq accepts ``#`` comments, so an edit to that
+        comment block that breaks jq's parse rather than bash's would ship
+        green. ``test_every_run_block_is_valid_shell`` covers the shell layer
+        only: an apostrophe in there would close the single-quoted string and
+        fail ``bash -n``, but an unbalanced brace would not.
+        """
+        text = STATUS_WORKFLOW.read_text()
+        anchor = "jq -n \\"
+        assert anchor in text
+        tail = text[text.index(anchor) :]
+        start = tail.index("'{")
+        end = tail.index("}'", start)
+        return tail[start + 1 : end + 1]
+
+    def test_the_program_production_hands_jq_comments_and_all_still_runs(self, tmp_path):
+        """The raw program must parse and produce the same document."""
+        if JQ is None:
+            pytest.skip("jq is not installed")
+        raw = self._raw_program()
+        assert "#" in raw, (
+            "no comment inside the program, so this test is no longer distinct "
+            "from the stripped one -- drop it or re-point it"
+        )
+        assert self._build(self._row(1), tmp_path) == self._build(self._row(1), tmp_path, program=raw)
+
+    def _build(self, row: dict, tmp_path: Path, program: str | None = None) -> dict:
         """Run the real program over ``row``, exactly as the workflow does."""
         if JQ is None:
             pytest.skip("jq is not installed")
@@ -1043,7 +1112,7 @@ class TestTheInputBuilderIsExecutedAndNotOnlyRead:
             path.write_text(json.dumps(row[name]))
             args += ["--slurpfile", name, str(path)]
         proc = subprocess.run(
-            [JQ, "-n", *args, self._program()],
+            [JQ, "-n", *args, program if program is not None else self._program()],
             capture_output=True,
             text=True,
             check=False,
@@ -1101,8 +1170,12 @@ class TestTheInputBuilderIsExecutedAndNotOnlyRead:
         """The literals, read out of the BUILT document rather than grepped.
 
         A ``"claude[bot]" in STATUS_WORKFLOW.read_text()`` assertion cannot see
-        either of these go wrong: that literal appears five times in this
-        workflow and seven in ``review-gate.jq``, nearly all of them in prose.
+        either of these go wrong: that literal appears four times in this
+        workflow and seven in ``review-gate.jq`` (counted 2026-11-02), and in
+        the jq five of the seven are prose. In the workflow two of the four are
+        live code -- the job's `issue_comment` condition and the builder
+        literal below -- which is still two spellings a text match cannot tell
+        apart from each other.
         """
         built = self._build(self._row(1), tmp_path)
         assert built["bot_logins"] == ["claude[bot]"], (
@@ -1174,3 +1247,281 @@ class TestTheInputBuilderIsExecutedAndNotOnlyRead:
         verdict = json.loads(proc.stdout)
         assert verdict["state"] == "failure", verdict
         assert "#102" in verdict["description"], verdict
+
+
+# --------------------------------------------------------------------------
+# Review findings on the port itself (2026-11-02)
+# --------------------------------------------------------------------------
+
+
+def test_the_two_halves_agree_on_what_asks_for_a_review():
+    """One gate, two workflows, and they must not disagree about the phrase.
+
+    ``claude-code-review.yml`` has answered ``@claude review`` since it was
+    written; ``require-review.yml``'s job condition accepted only ``/review``.
+    A reader following the reviewer's own documented phrase therefore got a
+    review and no status to show for it. On a provisioned repo that self-heals
+    -- the reviewer's ``claude[bot]`` comment re-fires the status workflow --
+    but this repo is NOT provisioned, so there it produced nothing at all.
+
+    The precedent for this shape of test is
+    ``test_the_author_exemptions_agree_between_the_two_files``: where one
+    decision is spelled in two files, assert the agreement rather than each
+    spelling.
+    """
+    phrases = {}
+    for path in (STATUS_WORKFLOW, REVIEWER_WORKFLOW):
+        condition = _load(path)["jobs"][next(iter(_load(path)["jobs"]))]["if"]
+        phrases[path.name] = set(
+            re.findall(r"(?:contains|startsWith)\(github\.event\.comment\.body, '([^']+)'\)", condition)
+        )
+    assert phrases[STATUS_WORKFLOW.name], "no comment-body trigger found in the status workflow"
+    assert phrases[STATUS_WORKFLOW.name] == phrases[REVIEWER_WORKFLOW.name], phrases
+    assert phrases[STATUS_WORKFLOW.name] == {"/review", "@claude review"}, phrases
+
+
+def test_the_err_trap_is_inherited_by_the_publish_function():
+    """``set -E``, measured rather than assumed.
+
+    Without ``errtrace`` an ERR trap is NOT inherited by shell functions, so a
+    failing ``gh api`` inside ``publish`` killed the step with the trap never
+    running -- the one failure the trap is installed for. Verified in bash on
+    2026-11-02::
+
+        set -euo pipefail;  f(){ false; }; trap 'echo X' ERR; f   -> no output
+        set -Eeuo pipefail; f(){ false; }; trap 'echo X' ERR; f   -> X
+
+    The ``if: failure()`` step publishes ``error`` either way, so this makes
+    the trap's own comment true rather than closing a gap. The control below
+    is the bash behaviour itself, so this test cannot pass on a shell where
+    the premise is false.
+    """
+    body = _publish_step()["run"]
+    assert "trap 'publish error" in body
+    assert "set -Eeuo pipefail" in body, "the ERR trap cannot fire for a failure inside `publish` without `-E`"
+
+    def _probe(flags: str) -> str:
+        proc = subprocess.run(
+            ["bash", "-c", f"set {flags}; f(){{ false; }}; trap 'echo TRAPPED' ERR; f"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return proc.stdout.strip()
+
+    assert _probe("-Eeuo pipefail") == "TRAPPED", "this shell does not honour errtrace at all"
+    assert _probe("-euo pipefail") == "", "this shell inherits ERR without -E, so -E is moot here"
+
+
+def _status_descriptions() -> list[str]:
+    """Every description literal this workflow hands to the statuses API.
+
+    Three sites, two spellings: the ``publish <state> \\`` helper's
+    continuation-line argument, and the ``-f description=`` of the raw POST in
+    the fallback step. Comments are stripped first so a paragraph quoting a
+    description is not mistaken for one.
+    """
+    active = active_lines(STATUS_WORKFLOW.read_text())
+    found = re.findall(r'publish \w+ \\\n\s+"([^"]+)"', active)
+    found += re.findall(r'\bpublish \w+ "([^"]+)"', active)
+    found += re.findall(r'-f description="([^"]+)"', active)
+    return found
+
+
+def test_every_status_description_the_shell_posts_fits_githubs_cap():
+    """``truncate140`` guards the jq verdicts; nothing guarded these.
+
+    ``test_never_exceeds_140_characters`` grades only the descriptions
+    ``review-gate.jq`` produces. The three the shell posts directly -- the
+    unprovisioned ``pending``, the trap's ``error``, the fallback's ``error``
+    -- bypass it entirely, and this port grew the first from 106 to 136
+    characters. The API truncates rather than erroring, so the failure mode is
+    a silently clipped instruction, which is worse than a rejected POST: the
+    part that gets cut is the end, and the end is where the remedy is.
+    """
+    descriptions = _status_descriptions()
+    assert len(descriptions) >= 3, f"the sweep found only {descriptions!r}"
+    for text in descriptions:
+        assert len(text) <= 140, f"{len(text)} chars: {text!r}"
+
+
+def test_control_the_description_sweep_can_see_an_overlong_one():
+    """Reachability control: an always-empty sweep passes the test above and
+    an always-empty sweep is what a broken regex produces. The length check
+    must be shown to fire, and the finder must be shown to find."""
+    assert any("Dependabot" in d for d in _status_descriptions()), (
+        "the sweep is not reading the unprovisioned description this port rewrote"
+    )
+    overlong = "x" * 141
+    assert len(overlong) > 140
+    assert not any(len(d) > 140 for d in _status_descriptions())
+
+
+class TestThePublishStepIsExecutedAndNotOnlyRead:
+    """The publish step's shell, RUN against a stub ``gh``.
+
+    Everything else in this module asserts the *shape* of this step -- that a
+    guard line is present, that it sits below the evaluation. A structural
+    assertion cannot see the step publish the wrong state, and the bug this
+    port came home to fix (the provisioning check pre-empting the verdict) was
+    a defect in exactly that: ordering, not wording. So this class runs the
+    real ``run:`` body and asserts the state that reaches the statuses API.
+
+    It is runnable at all only because the step takes every value through
+    ``env:`` and interpolates no ``${{ }}`` into the script -- which is a
+    security property (a PR title spliced into shell is an injection surface)
+    that happens to make the step testable. ``test_bans_github_expressions_
+    from_run_blocks`` keeps it that way, so this class and that one hold each
+    other up.
+    """
+
+    CASES = {
+        # (token, author, reviews) -> expected state, substring of description
+        "provisioned, fresh review by Tom": ("tok", "dispatch-bot[bot]", True, "success", "tclancy"),
+        "provisioned, no review": ("tok", "dispatch-bot[bot]", False, "failure", "No code review"),
+        # The bug B fixed. With the check upstream of the verdict these two
+        # published `pending`/"add the secret" -- about a secret that exists,
+        # and over a PR the gate itself exempts or passes.
+        "unprovisioned, Dependabot PR": (
+            "",
+            "dependabot[bot]",
+            False,
+            "success",
+            "Review not required: Dependabot",
+        ),
+        "unprovisioned, fresh review by Tom": ("", "dispatch-bot[bot]", True, "success", "tclancy"),
+        # And `pending` must still be reachable where it IS the right answer.
+        "unprovisioned, no review": ("", "dispatch-bot[bot]", False, "pending", "Dependabot uses a separate"),
+    }
+
+    @staticmethod
+    def _step_body() -> str:
+        body = _publish_step()["run"]
+        assert "${{" not in body, (
+            "the step interpolates a GitHub expression, so it cannot be run "
+            "outside Actions -- and that is a command-injection surface too"
+        )
+        return body
+
+    def _run(self, tmp_path: Path, token: str, author: str, with_review: bool) -> tuple[str, str, dict]:
+        """Execute the step body and return the (state, description, fields) posted.
+
+        A fresh subdirectory per call, so a test may run the step twice in one
+        ``tmp_path`` -- which ``test_control_the_harness_can_see_a_wrong_state``
+        has to do to prove the harness is not returning a constant.
+        """
+        if JQ is None:
+            pytest.skip("jq is not installed")
+        slot = len(list(tmp_path.glob("run-*")))
+        root = tmp_path / f"run-{slot}"
+        work = root / "work"
+        (work / ".github").mkdir(parents=True)
+        (work / ".github" / "review-gate.jq").write_text(GATE.read_text())
+
+        reviews = (
+            [
+                {
+                    "user": {"login": "tclancy"},
+                    "state": "APPROVED",
+                    "submitted_at": AFTER_HEAD,
+                    "author_association": "OWNER",
+                }
+            ]
+            if with_review
+            else []
+        )
+        fixtures = {
+            "comments": [],
+            "reviews": reviews,
+            "pr": {"number": 42, "user": {"login": author}, "title": "feat: a change"},
+            "head": {"commit": {"committer": {"date": HEAD_AT}, "author": {"date": BEFORE_HEAD}}},
+        }
+        for name, value in fixtures.items():
+            (work / f"fixture-{name}.json").write_text(json.dumps(value))
+
+        # A stub `gh` that serves the four reads from the fixtures above and
+        # records the status POST. `--jq '.[]'` on the paginated reads is
+        # honoured by streaming with real jq, because reassembling that stream
+        # is the thing the step's `jq -s '.'` exists to do.
+        bindir = root / "bin"
+        bindir.mkdir()
+        gh = bindir / "gh"
+        gh.write_text(
+            "#!/bin/bash\n"
+            'if [ "$2" = "-X" ] && [ "$3" = "POST" ]; then\n'
+            '  printf "%s\\n" "$@" > "$POSTED"\n'
+            "  exit 0\n"
+            "fi\n"
+            'case "$2" in\n'
+            f'  */issues/*/comments) {JQ} -c ".[]" "{work}/fixture-comments.json" ;;\n'
+            f'  */pulls/*/reviews)   {JQ} -c ".[]" "{work}/fixture-reviews.json" ;;\n'
+            f'  */commits/*)         cat "{work}/fixture-head.json" ;;\n'
+            f'  */pulls/*)           cat "{work}/fixture-pr.json" ;;\n'
+            '  *) echo "stub gh: unexpected $*" >&2; exit 1 ;;\n'
+            "esac\n"
+        )
+        gh.chmod(0o755)
+
+        posted = root / "posted.txt"
+        env = {
+            "PATH": f"{bindir}:{Path(JQ).parent}:/usr/bin:/bin",
+            "POSTED": str(posted),
+            "GH_TOKEN": "stub",
+            "REPO": "tclancy/abi-django-utils",
+            "NUMBER": "42",
+            "SHA": "deadbeef",
+            "RUN_URL": "https://example.invalid/run/1",
+            "REVIEWER_TOKEN": token,
+        }
+        proc = subprocess.run(
+            ["bash", "-c", self._step_body()],
+            cwd=work,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert proc.returncode == 0, f"the step failed:\n{proc.stdout}\n{proc.stderr}"
+        assert posted.is_file(), f"no status was posted at all:\n{proc.stdout}\n{proc.stderr}"
+        args = posted.read_text().splitlines()
+        fields = dict(a.split("=", 1) for a in args if "=" in a)
+        # The POST target is the one positional argument that is a path.
+        fields["_url"] = next(a for a in args if a.startswith("repos/"))
+        return fields["state"], fields["description"], fields
+
+    @pytest.mark.parametrize("case", sorted(CASES))
+    def test_the_step_publishes_the_right_state(self, tmp_path, case):
+        token, author, with_review, want_state, want_in_description = self.CASES[case]
+        state, description, _ = self._run(tmp_path, token, author, with_review)
+        assert state == want_state, f"{case}: posted {state!r} / {description!r}"
+        assert want_in_description in description, f"{case}: {description!r}"
+
+    def test_control_the_harness_can_see_a_wrong_state(self, tmp_path):
+        """Reachability control for the parametrize above.
+
+        Every case there asserts equality against a constant, so a harness
+        that always returned the same thing -- or that silently graded the
+        same case five times -- would pass all five. Two cases that differ in
+        the token ALONE must come back with different states.
+        """
+        unprovisioned, _, _ = self._run(tmp_path, "", "dispatch-bot[bot]", False)
+        provisioned, _, _ = self._run(tmp_path, "tok", "dispatch-bot[bot]", False)
+        assert unprovisioned == "pending"
+        assert provisioned == "failure"
+        assert unprovisioned != provisioned
+
+    def test_the_posted_status_carries_the_agreed_context_and_the_head_sha(self, tmp_path):
+        """The step must post to the SHA it was handed, under the one context
+        the fleet's ``pr-gates`` sweep reads -- and every description it posts
+        must fit GitHub's cap, which is checked here against the EXECUTED text
+        rather than against a literal grepped out of the file."""
+        state, description, fields = self._run(tmp_path, "tok", "dispatch-bot[bot]", True)
+        assert fields["context"] == "dispatch/require-review"
+        assert fields["target_url"] == "https://example.invalid/run/1"
+        # The SHA, which is the whole reason this gate is a commit status and
+        # not a check-run: a check-run binds to the SHA of its own event, so an
+        # `issue_comment` run's verdict lands on the default branch
+        # (metaframework#620). The step must post to the head it resolved.
+        assert fields["_url"].endswith("/statuses/deadbeef"), fields["_url"]
+        assert state == "success"
+        assert len(description) <= 140, f"{len(description)}: {description!r}"
