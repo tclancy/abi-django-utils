@@ -192,13 +192,8 @@ jobs:
           NUMBER: ${{ steps.pr.outputs.number }}
           SHA: ${{ steps.pr.outputs.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          # Layer 0 (see the `claude-code-action-review-gate` skill): an UNSET
-          # secret interpolates to the empty string, so this is how the gate
-          # learns the reviewer cannot run at all. The bot App 403s on
-          # `actions/secrets`, so until Tom adds one the gate would otherwise
-          # be a permanent red X with no remedy available to anyone but him.
-          # `pending` instead: visibly not-green, not a false pass, and it
-          # names the owner and the remedy.
+          # Read by the unprovisioned branch at the END of the step below --
+          # the ordering is load-bearing and the reasoning is at the branch.
           REVIEWER_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           set -euo pipefail
@@ -211,21 +206,6 @@ jobs:
               -f target_url="${RUN_URL}" >/dev/null
             printf 'dispatch/require-review = %s: %s\n' "$1" "$2"
           }
-
-          if [ -z "${REVIEWER_TOKEN}" ]; then
-            # The description is capped at 140 characters by GitHub, so it
-            # names the first step only; the notice carries both. The second
-            # step is easy to miss and is just as load-bearing: this gate
-            # matches on the login `claude[bot]`, which exists only if the
-            # Claude GitHub App is installed on this repo. Secret without App
-            # => the reviewer's comments post under a different login, the
-            # gate never matches, and the PR sits red with a remedy that
-            # cannot work.
-            echo "::notice::Review gate not provisioned. Two steps, both Tom's: (1) add the CLAUDE_CODE_OAUTH_TOKEN repo secret; (2) install the Claude GitHub App on this repo, so the reviewer posts as claude[bot] - this gate matches on that login."
-            publish pending \
-              "Not provisioned: add the CLAUDE_CODE_OAUTH_TOKEN repo secret to enable the reviewer, then re-gate this PR."
-            exit 0
-          fi
 
           # Publish `error` rather than nothing if anything below blows up.
           # Without this the step just dies under `set -e` and NO status is
@@ -268,34 +248,111 @@ jobs:
                # fresh here, this line is why.
                head_committed_at: $head[0].commit.committer.date,
                bot_logins: ["claude[bot]"],
+               reviewer_logins: ["tclancy"],
                comments: $comments[0],
                reviews: $reviews[0] }' > gate-input.json
 
           verdict="$(jq -f .github/review-gate.jq gate-input.json)"
-          publish "$(printf '%s' "$verdict" | jq -r .state)" \
-                  "$(printf '%s' "$verdict" | jq -r .description)"
+          state="$(printf '%s' "$verdict" | jq -r .state)"
+          description="$(printf '%s' "$verdict" | jq -r .description)"
 
-      # Finding from review: the `trap` above is installed inside that step, so
-      # a `gh api` failure in *Resolve PR number and head SHA* or *Is this a
-      # cross-repository PR?* would fail the job and skip it -- leaving the
-      # head's PREVIOUS status standing, which on an approved-then-pushed PR is
-      # a stale GREEN. That is the exact thing the trap exists to prevent, one
-      # scope up. This step closes it for the job.
+          # THE PROVISIONING CHECK IS DOWNSTREAM OF THE VERDICT, AND THAT
+          # ORDERING IS THE FIX FOR A REAL BUG -- found in review on
+          # parsons-remote PR #26, which was cut from this file.
+          #
+          # Layer 0 (see the `claude-code-action-review-gate` skill): an unset
+          # secret interpolates to the empty string, which is how the gate
+          # learns the reviewer cannot run at all. The bot App 403s on
+          # `actions/secrets`, so until Tom adds one the gate would otherwise
+          # be a permanent red X with no remedy available to anyone but him.
+          # `pending` instead: visibly not-green, not a false pass, and it
+          # names the owner and the remedy.
+          #
+          # This branch USED to sit above the evaluation and `exit 0` out of
+          # it. A Dependabot `pull_request` event is served from GitHub's
+          # SEPARATE Dependabot secret store, so this variable is empty on it
+          # even once the repo secret exists -- so every Dependabot PR
+          # published `pending` and told the reader to add a secret that was
+          # already there, instead of the `success` /"Review not required:
+          # Dependabot PR" that `review-gate.jq`'s own `exempt_reason` returns
+          # for it. This repo has a `.github/dependabot.yml`, so that was a
+          # live shape. The same ordering also overrode a genuine fresh review
+          # on any event where the secret is not visible.
+          #
+          # AN EXEMPTION MUST NEVER SIT DOWNSTREAM OF A PROVISIONING CHECK.
+          # Reading `$state` first is what makes `pending` reachable only when
+          # the gate has nothing better to say.
+          if [ "$state" != "success" ] && [ -z "${REVIEWER_TOKEN}" ]; then
+            # The description is capped at 140 characters by GitHub, so it
+            # names the first step only; the notice carries both. The second
+            # step is easy to miss and is just as load-bearing: this gate
+            # matches on the login `claude[bot]`, which exists only if the
+            # Claude GitHub App is installed on this repo. Secret without App
+            # => the reviewer's comments post under a different login, the
+            # gate never matches, and the PR sits red with a remedy that
+            # cannot work.
+            echo "::notice::Review gate not provisioned. Two steps, both Tom's: (1) add the CLAUDE_CODE_OAUTH_TOKEN repo secret; (2) install the Claude GitHub App on this repo, so the reviewer posts as claude[bot] - this gate matches on that login."
+            publish pending \
+              "Not provisioned for this event: no CLAUDE_CODE_OAUTH_TOKEN visible, so the reviewer cannot run. Dependabot uses a separate secret store."
+            exit 0
+          fi
+
+          publish "$state" "$description"
+
+      # A GATE FAILURE MUST NOT LEAVE THE LAST VERDICT STANDING, and the
+      # `trap` above is installed inside the publish step -- so a `gh api`
+      # failure in *Resolve PR number and head SHA* or *Is this a
+      # cross-repository PR?* fails the job without reaching it, leaving the
+      # head's PREVIOUS status in place. On a re-evaluation of an
+      # already-green head (a `/review` comment, a dismissed review) that is a
+      # stale GREEN. This step closes the invariant for the whole job.
       #
-      # `steps.pr.outputs.sha` is tested because there is nowhere to post a
-      # status if the resolution step is what died, and the fork check is
-      # honoured because a fork PR's token cannot write one anyway.
-      - name: Publish an error verdict if any step above failed
-        if: failure() && steps.pr.outputs.sha != '' && steps.fork.outputs.fork != 'true'
+      # ITS CONDITION USED TO READ `&& steps.pr.outputs.sha != ''`, WHICH
+      # DISARMED IT IN EXACTLY THE CASE IT WAS ADDED FOR. When the resolution
+      # step is the one that died its output is empty, the condition is false,
+      # and no verdict is published -- which is the whole scenario the
+      # paragraph above describes. The reasoning for the guard ("there is
+      # nowhere to post a status if the resolution step is what died") was
+      # wrong twice over: `pull_request` and `pull_request_review` both carry
+      # the head SHA in the event payload, and for `issue_comment` the API
+      # lookup can simply be retried here. So this step resolves a SHA for
+      # itself and warns if it cannot, rather than being skipped.
+      #
+      # The fork check IS still honoured -- a cross-repository PR's token
+      # cannot write a commit status, so attempting one is a guaranteed 403 in
+      # the log. Note that it reads `!= 'true'`, so it also passes when the
+      # fork step is itself the step that failed and its output is empty.
+      #
+      # `set -uo pipefail` and not `-euo`: a fallback step that aborts on its
+      # own first error is not a fallback. Every command that may legitimately
+      # fail here carries `|| true` and is tested for an empty result.
+      - name: A failure anywhere above must not leave a stale verdict standing
+        if: failure() && steps.fork.outputs.fork != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          SHA: ${{ steps.pr.outputs.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          set -euo pipefail
-          gh api -X POST "repos/${REPO}/statuses/${SHA}" \
-            -f state="error" \
+          set -uo pipefail
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            number="$ISSUE_NUMBER"
+          else
+            number="$PR_NUMBER"
+            sha="$PR_HEAD_SHA"
+          fi
+          if [ -z "${sha:-}" ]; then
+            sha="$(gh api "repos/${REPO}/pulls/${number}" --jq .head.sha || true)"
+          fi
+          if [ -z "${sha:-}" ]; then
+            echo "::warning::Could not resolve a head SHA, so no status could be published. The PR keeps whatever status it already had - read it as unverified."
+            exit 0
+          fi
+          gh api -X POST "repos/${REPO}/statuses/${sha}" \
+            -f state=error \
             -f context="dispatch/require-review" \
-            -f description="Gate could not be evaluated - a step failed before the verdict. This is a gate failure, not a review verdict." \
-            -f target_url="${RUN_URL}" >/dev/null
+            -f description="Gate failed before it could evaluate - see the run log. Not a review verdict." \
+            -f target_url="${RUN_URL}" >/dev/null || true

@@ -19,6 +19,7 @@
 #     "author":            "<PR author login>",
 #     "title":             "<PR title>",
 #     "bot_logins":        ["claude[bot]"],
+#     "reviewer_logins":   ["tclancy"],
 #     "comments":          [ GitHub issue-comment objects ],
 #     "reviews":           [ GitHub review objects ]
 #   }
@@ -165,7 +166,7 @@ def exempt_reason:
 # needs no separate guard.
 def is_bot($bots): . as $l | ($bots | index($l)) != null;
 
-def candidates($bots):
+def candidates($bots; $reviewers):
   # Comments first, then formal reviews -- so a PR satisfied by a bot review
   # comment reports that rather than a formal review that happens to coexist.
   #
@@ -180,7 +181,40 @@ def candidates($bots):
       | select(.body | counts_as_review)
       | { ts: .updated_at,
           why: "Review present: comment by \(.user.login // "?") at \(.updated_at // "?")" } ),
+    # THE LOGIN FILTER ON THIS ARM IS LOAD-BEARING, and its absence was a
+    # FALSE GREEN. Found in review on bluelinky PR #53, carried into
+    # parsons-remote PR #26 and lintarr PR #49, and reproduced against THIS
+    # repo's committed program on 2026-11-02 before being fixed here:
+    #
+    #   reviews: [{user: {login: "random-passerby"},
+    #              state: "CHANGES_REQUESTED"}]
+    #     -> {"state":"success","description":"Review present: formal ..."}
+    #
+    # This repo is PUBLIC (`gh repo view tclancy/abi-django-utils --json
+    # visibility` is `PUBLIC`, 2026-11-02), so any authenticated GitHub account
+    # can submit a review on an open PR and turn the gate green having read
+    # nothing -- and `CHANGES_REQUESTED`, the most adversarial verdict
+    # available, worked exactly as well as an approval, because this arm
+    # filtered on the review's STATE and never on its author. Worse for the
+    # gate's actual threat model: GitHub permits one App installation to review
+    # another's PR, so `metaframework-dispatch-bot[bot]` approving a
+    # `dispatch-bot[bot]` PR satisfied it too. That is the same one-command
+    # self-service bypass this file refuses to grant `chore:` titles.
+    #
+    # `$reviewers`, not `$bots`: the two lists answer different questions and
+    # must not be merged. A review BOT satisfies the gate by posting a comment;
+    # a HUMAN satisfies it by submitting a formal verdict. Defaulting
+    # `reviewer_logins` to `["tclancy"]` keeps this arm as the Tom-shaped escape
+    # hatch it is meant to be -- and on this repo, with no Claude App installed,
+    # it is currently the ONLY arm that can ever fire.
+    #
+    # The filter is inside `candidates` and not in the freshness pass, which is
+    # deliberate: a stranger's review is FRESH, so filtering it later would put
+    # a never-reviewed PR into the STALE refusal and tell the reader to
+    # `/review` a head that has had no review at all. Pinned by
+    # `test_a_fresh_stranger_review_does_not_mask_a_genuinely_absent_one`.
     ( .reviews[]?
+      | select(.user.login | is_bot($reviewers))
       | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED")
       | { ts: .submitted_at,
           why: "Review present: formal \(.state) by \(.user.login // "?") at \(.submitted_at // "?")" } )
@@ -188,11 +222,12 @@ def candidates($bots):
 
 . as $pr
 | ($pr.bot_logins // ["claude[bot]"]) as $bots
+| ($pr.reviewer_logins // ["tclancy"]) as $reviewers
 | $pr.head_committed_at as $head
 | ($pr | exempt_reason) as $exempt
 | if $exempt != null then pass($exempt)
   else
-    ($pr | candidates($bots)) as $all
+    ($pr | candidates($bots; $reviewers)) as $all
     | ($all | map(select(.ts | is_fresh($head)))) as $fresh
     | if ($fresh | length) > 0 then pass($fresh[0].why)
       elif ($all | length) > 0 then
