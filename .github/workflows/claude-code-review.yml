@@ -1,0 +1,235 @@
+name: Claude Code Review
+
+# Issue #24, first half. Adapted from `tclancy/bluelinky`'s copy (PR #52),
+# which is the precedent for this rollout (tclancy/bluelinky#35 option (a),
+# greenlit 2026-10-24), rather than written fresh -- so the five config layers
+# that each fail quietly are already right here.
+#
+# Steady-state burn reduction (metaframework#320 section 5):
+#   - Auto-trigger on `opened`/`reopened` only, never `synchronize`. A 10-commit
+#     PR would otherwise fire 10 model reviews; this fires one.
+#   - Skip Dependabot and `chore` PRs entirely. `.github/review-gate.jq` exempts
+#     Dependabot for the same reason, and `tests/test_review_gate.py` asserts
+#     the two stay in step -- a gate demanding a review the reviewer declines
+#     to perform is a permanent red X with no remedy.
+
+on:
+  pull_request:
+    # `opened` alone cannot re-gate a fix-up push, and the documented fallback
+    # cannot either: a check-run attaches to the SHA of its own event, so an
+    # `issue_comment` (`/review`) run attaches to the default branch and never
+    # marks the PR head reviewed, while the `opened` verdict is simply ABSENT
+    # from a new head -- which renders as green rather than as unreviewed
+    # (metaframework#620, #707). `reopened` costs one review per deliberate
+    # `gh pr close && gh pr reopen` and is the only on-demand trigger an agent
+    # can fire that carries the PR head. `synchronize` stays off: it fires once
+    # per push, which is the exact burn #320 section 5 cut.
+    types: [opened, reopened]
+  issue_comment:
+    types: [created]
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  # MUST stay false. Concurrency cancellation happens when a run is CREATED,
+  # before job-level `if` filtering -- so with `true`, any comment on the PR
+  # (including the review's own `gh pr comment`) spawns an `issue_comment` run
+  # in this group and cancels the in-flight review job. On the repo where that
+  # was measured, every pull_request-triggered review self-cancelled seconds
+  # after posting.
+  cancel-in-progress: false
+
+jobs:
+  claude-review:
+    # Run when a PR is opened/reopened by a non-Dependabot author with a
+    # non-`chore` title, or when a comment explicitly asks for a review.
+    # Cross-repository (fork) PRs are excluded from the `pull_request` path:
+    # Actions cannot post inline comments back to the base repo from a fork (a
+    # GitHub security boundary), so the reviewer would burn its turn budget
+    # being denied and exit having posted nothing. This repo is PUBLIC, so
+    # outside PRs are a real shape here rather than a hypothetical one.
+    #
+    # THE `issue_comment` PATH BELOW HAS NO SUCH CHECK, and cannot: the
+    # `issues` payload carries no head-repo field, and a job-level `if:` cannot
+    # make an API call. `require-review.yml` resolves the head repo via `gh api`
+    # in a step and therefore screens all of its triggers; this one does not.
+    # That asymmetry is safe rather than merely tolerated: the action runs
+    # `checkWritePermissions` before it posts anything, so only an actor with
+    # write access can get a `/review` on a fork PR as far as a checkout.
+    #
+    # THE DISCRIMINATOR IS `head.repo.full_name`, NOT `head.repo.fork`.
+    # `head.repo.fork` answers "is the head repo a fork of something", which is
+    # a property of the REPO and not of the PR. It happens to be false for
+    # every PR in this repo today, because `tclancy/abi-django-utils` is not
+    # itself a fork (measured 2026-10-25) -- so here the wrong spelling would
+    # pass its tests and look correct. It is still wrong, and on the sibling
+    # repo that shipped this gate first it was load-bearing: `tclancy/bluelinky`
+    # IS a fork, so `head.repo.fork` is `true` for every same-repo branch in it
+    # and that spelling skipped 100% of its PRs while reading as a correctly
+    # installed gate. Comparing full names asks the question actually being
+    # asked -- did this branch come from somewhere else?
+    # `startsWith` and not `contains` on the `/review` trigger: a comment that
+    # merely QUOTES a review URL -- `repos/tclancy/abi-django-utils/pulls/5/reviews`
+    # -- contains the substring, and under `contains` would spawn a full model
+    # review nobody asked for. `#320` section 5 is cited twice in this file as
+    # the reason `synchronize` is off; an accidental run from a pasted link is
+    # the same cost. The gate's own refusal text says "Comment /review", which
+    # is the spelling `startsWith` accepts. `@claude review` keeps `contains`,
+    # because an @-mention is normally mid-sentence.
+    if: |
+      (github.event_name == 'pull_request'
+        && github.event.pull_request.head.repo.full_name == github.repository
+        && github.event.pull_request.user.login != 'dependabot[bot]'
+        && !startsWith(github.event.pull_request.title, 'chore'))
+      || (github.event_name == 'issue_comment'
+        && github.event.issue.pull_request != null
+        && (startsWith(github.event.comment.body, '/review')
+            || contains(github.event.comment.body, '@claude review')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      # LAYER 1. The action mints its GitHub App token by exchanging a GitHub
+      # OIDC token, so it needs this scope even though a Claude token is also
+      # passed. Missing => "Could not fetch an OIDC token".
+      id-token: write
+
+    steps:
+      # LAYER 0, and the reason this step exists here but not in every fleet
+      # copy. An UNSET secret interpolates to the empty string, so the action
+      # receives a defined-but-empty credential and fails its own validation
+      # ("Either ANTHROPIC_API_KEY, CLAUDE_CODE_OAUTH_TOKEN, ... is required")
+      # before doing any work. The bot App 403s on `actions/secrets`, so no
+      # agent can read or set this repo's secrets; without this gate, merging
+      # #24 would put a red X on every PR here until Tom pastes in a token.
+      # Until then this is a clean green no-op -- and `require-review.yml`
+      # publishes `pending` with the remedy, so the no-op does NOT read as a
+      # passing review (metaframework#777).
+      - name: Is the reviewer token configured?
+        id: gate
+        env:
+          REVIEWER_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${REVIEWER_TOKEN}" ]; then
+            echo "ready=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=no" >> "$GITHUB_OUTPUT"
+            echo "::notice::CLAUDE_CODE_OAUTH_TOKEN is not set - review skipped. Two provisioning steps, both Tom's (issue #24): add the repo secret, and install the Claude GitHub App so the reviewer posts as claude[bot], which is the login .github/review-gate.jq matches on."
+          fi
+
+      - name: Resolve PR head SHA
+        id: pr
+        if: steps.gate.outputs.ready == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            sha="$(gh api "repos/${REPO}/pulls/${ISSUE_NUMBER}" --jq .head.sha)"
+          else
+            sha="$PR_HEAD_SHA"
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.ready == 'yes'
+        with:
+          fetch-depth: 1
+          # The PR head, not the merge ref: an `issue_comment` run would
+          # otherwise review the default branch.
+          ref: ${{ steps.pr.outputs.sha }}
+
+      # BUMPING THIS PIN IS A GATE CHANGE, not a dependency bump.
+      # `.github/review-gate.jq` decides whether a bot comment represents a
+      # real review by matching the action's own status lines anchored at byte
+      # 0 (`^\*{0,2}Claude (Code is working|finished|encountered an error)`).
+      # At this SHA `createCommentBody` emits those at the start of the body.
+      # If a later version prepends anything -- an HTML marker, a blank line --
+      # the in-flight comment stops being recognised as a status comment and is
+      # counted as a review, which is metaframework#687 restored. Re-check the
+      # three shapes in `tests/test_review_gate.py` against the new source
+      # before merging a bump.
+      - name: Run Claude Code Review
+        if: steps.gate.outputs.ready == 'yes'
+        uses: anthropics/claude-code-action@1d6de8cb0c237e7c15e9e1bdf973826ebae490cc # v1.0.248
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # LAYER 4. The action blocks bot actors by default, so an
+          # agent-authored PR fails with "Workflow initiated by non-human actor
+          # ... Add bot to allowed_bots" -- which makes the gate a no-op for
+          # exactly the PRs #24 wants graded. Named, not `*`: fork PRs are
+          # excluded above but this repo is public, so an allow-list of one
+          # known bot is cheap.
+          allowed_bots: 'metaframework-dispatch-bot'
+          # LAYER 3, and the non-obvious one. `--allowed-tools` only FILTERS
+          # already-registered MCP servers; it does not register them. Without
+          # track_progress the github_inline_comment server never connects, so
+          # the inline-comment tool is denied even when correctly allow-listed
+          # -- the model burns turns retrying and the job exits `success` having
+          # posted nothing. The tell is `No buffered inline comments` in the
+          # log (diagnosed on sandy#160/#164).
+          track_progress: true
+          # Defaults to TRUE and has documented buffering bugs; upstream's own
+          # example omits it, which reads as "default is fine" but leaves the
+          # buggy path on. Pinned off so an upstream default change cannot
+          # silently reintroduce it.
+          classify_inline_comments: false
+          prompt: |
+            Review this pull request for:
+            - Code quality and best practices
+            - Potential bugs or issues
+            - Performance considerations
+            - Security concerns
+            - Test coverage
+
+            This is a shared Django utility library consumed by several of
+            Tom's apps, so a defect here lands in all of them at once. Pay
+            particular attention to the security helpers in
+            `src/abi_django_utils/` -- brute_force, geo_gate, tls_proxy,
+            queryguard, password_audit -- and to whether a setting a caller is
+            told to adopt is actually read by the package that consumes it.
+
+            Use the repository's README.md for guidance on style and
+            conventions, and CLAUDE.md as well if the checkout has one.
+            Be constructive and specific.
+
+            Post findings that point at specific lines with
+            mcp__github_inline_comment__create_inline_comment. Use `gh pr comment`
+            for the overall summary, or for findings with no single line to anchor
+            to. Say so in the summary if you find nothing worth flagging, so a
+            silent pass is distinguishable from a broken run.
+          # mcp__github_inline_comment__create_inline_comment must be listed
+          # here AND registered by track_progress above -- both, or inline
+          # comments silently no-op.
+          #
+          # --max-turns 40 is a MEASUREMENT, and it is itguy's, not this repo's
+          # -- carried across because this repo has no runs of its own to
+          # measure yet. The evidence that 25 is wrong, from itguy's streamed
+          # result JSON under that cap (itguy#211, fixed in itguy PR #220):
+          #
+          #   run 34088207877  #212  26 turns / 10 denials  $0.49  error_max_turns
+          #   run 34088470544  #212  27 turns / 10 denials         success
+          #   run 34127739755  #216  32 turns /  7 denials  $0.59  success
+          #   run 34171629175  #219  26 turns /  9 denials  $0.55  error_max_turns
+          #   run 34171815438  #219  26 turns /  6 denials         success
+          #
+          # Three of the five completed a real review and were failed anyway by
+          # the action's post-check ("reported a successful result after 32
+          # turns, exceeding the configured maximum of 25"). The cap was not
+          # protecting against runaway reviews, it was discarding finished
+          # ones. 32 is the measured requirement; 40 is that plus headroom, and
+          # matches the fleet repos already there.
+          #
+          # What is being denied 6-10 times a run is still UNIDENTIFIED: the
+          # streamed log records the denial count and never which tool. The
+          # TodoWrite hypothesis is refuted for itguy -- `grep -c TodoWrite`
+          # over two full run logs is 0, and three of the five runs above
+          # ticked their checklists completely without it allow-listed. It is
+          # listed below for fleet consistency and because it is harmless, not
+          # as a fix.
+          claude_args: '--allowed-tools "mcp__github_inline_comment__create_inline_comment,TodoWrite,Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)" --max-turns 40'
